@@ -41,7 +41,7 @@ jobs:
           printf 'storeFile=pixelplayeross-ci.jks\nstorePassword=%s\nkeyAlias=pixelplayeross-ci-key\nkeyPassword=%s\n' "$P" "$P" > keystore.properties
 
       - name: Build
-        run: ./gradlew :app:assembleRelease -Ppixelplayer.enableAbiSplits=true
+        run: chmod +x gradlew && ./gradlew :app:assembleRelease -Ppixelplayer.enableAbiSplits=true
 
       - uses: actions/upload-artifact@v7.0.1
         with:
