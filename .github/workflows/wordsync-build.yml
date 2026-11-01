@@ -41,6 +41,10 @@ jobs:
           printf 'storeFile=pixelplayeross-ci.jks\nstorePassword=%s\nkeyAlias=pixelplayeross-ci-key\nkeyPassword=%s\n' "$P" "$P" > keystore.properties
 
       - name: Build
+              - name: Strip UTF-8 BOM from baseline profiles
+        run: sed -i '1s/^\xEF\xBB\xBF//' app/src/release/generated/baselineProfiles/baseline-prof.txt app/src/release/generated/baselineProfiles/startup-prof.txt
+
+      - name: Build
         run: chmod +x gradlew && ./gradlew :app:assembleRelease -Ppixelplayer.enableAbiSplits=true
 
       - uses: actions/upload-artifact@v7.0.1
