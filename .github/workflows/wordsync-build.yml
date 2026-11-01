@@ -44,7 +44,7 @@ jobs:
         run: sed -i '1s/^\xEF\xBB\xBF//' app/src/release/generated/baselineProfiles/baseline-prof.txt app/src/release/generated/baselineProfiles/startup-prof.txt
 
       - name: Build
-        run: python3 gen_missing_strings.py && chmod +x gradlew && ./gradlew :app:assembleRelease -Ppixelplayer.enableAbiSplits=true
+        run: python3 gen_missing_strings.py && python3 make_parallel.py && chmod +x gradlew && ./gradlew :app:assembleRelease -Ppixelplayer.enableAbiSplits=true
 
       - uses: actions/upload-artifact@v7.0.1
         with:
