@@ -424,4 +424,6 @@
     <string name="setcat_playback_client_desc">Scegli il client. Android VR è più veloce; Web Client usa YouTube Music.</string>
     <string name="setcat_playback_client_android_vr">Android VR (Predefinito)</string>
     <string name="setcat_playback_client_web_remix">Client Web</string>
+    <string name="setcat_lyrics_plus_title">Testi parola per parola (LyricsPlus)</string>
+    <string name="setcat_lyrics_plus_subtitle">Scarica testi sincronizzati sillaba per sillaba dai mirror di LyricsPlus, gestiti da volontari. Invia titolo, artista, album e durata del brano a quei server. Richiede i testi online.</string>
 </resources>

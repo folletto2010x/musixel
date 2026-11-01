@@ -815,7 +815,12 @@ object LyricsUtils {
             if (line.isEmpty()) return@any false
             if (LRC_METADATA_PATTERN.matcher(line).matches()) return@any false
             val m = KUGOU_LINE_REGEX.matcher(line)
-            m.matches() && (m.group(1)?.toLongOrNull() ?: 0L) > 999L
+            m.matches() && (
+                (m.group(1)?.toLongOrNull() ?: 0L) > 999L ||
+                    // A line starting inside the first second is still Kugou-style
+                    // when its words carry the <offset,duration,flag> tags.
+                    KUGOU_WORD_PATTERN.matcher(m.group(3) ?: "").find()
+                )
         }
     }
 
@@ -849,8 +854,8 @@ object LyricsUtils {
             val headerMatcher = KUGOU_LINE_REGEX.matcher(line)
             if (!headerMatcher.matches()) continue
             val lineStartMs = (headerMatcher.group(1)?.toLongOrNull() ?: continue) + globalOffsetMs
-            if (lineStartMs <= 999L && globalOffsetMs == 0L) continue
             val body = headerMatcher.group(3) ?: ""
+            if (lineStartMs <= 999L && globalOffsetMs == 0L && !KUGOU_WORD_PATTERN.matcher(body).find()) continue
 
             val words = mutableListOf<SyncedWord>()
             val wordMatcher = KUGOU_WORD_PATTERN.matcher(body)
@@ -858,6 +863,7 @@ object LyricsUtils {
 
             while (wordMatcher.find()) {
                 val wordOffsetMs = wordMatcher.group(1)?.toLongOrNull() ?: 0L
+                val wordDurationMs = wordMatcher.group(2)?.toLongOrNull() ?: 0L
                 val rawText = wordMatcher.group(4) ?: ""
 
                 val startsNew = previousEndsWithSpace || rawText.firstOrNull()?.isWhitespace() == true
@@ -870,7 +876,12 @@ object LyricsUtils {
                     SyncedWord(
                         time = (lineStartMs + wordOffsetMs).toInt(),
                         word = wordText,
-                        startsNewWord = startsNew
+                        startsNewWord = startsNew,
+                        endTime = if (wordDurationMs > 0L) {
+                            (lineStartMs + wordOffsetMs + wordDurationMs).toInt()
+                        } else {
+                            null
+                        }
                     )
                 )
             }

@@ -29,5 +29,7 @@ data class SyncedLine(
 data class SyncedWord(
     val time: Int,
     val word: String,
-    val startsNewWord: Boolean = true
+    val startsNewWord: Boolean = true,
+    /** When the word stops being sung, if the source says so; null = until the next word. */
+    val endTime: Int? = null
 )

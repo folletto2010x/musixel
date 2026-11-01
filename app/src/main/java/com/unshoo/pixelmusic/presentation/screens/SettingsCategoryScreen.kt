@@ -600,6 +600,14 @@ fun SettingsCategoryScreen(
                                     modifier = Modifier.settingHighlight("item_library_external_lyrics", highlightKey)
                                 )
                                 SwitchSettingItem(
+                                    title = stringResource(R.string.setcat_lyrics_plus_title),
+                                    subtitle = stringResource(R.string.setcat_lyrics_plus_subtitle),
+                                    checked = uiState.lyricsPlusEnabled,
+                                    onCheckedChange = { settingsViewModel.setLyricsPlusEnabled(it) },
+                                    enabled = uiState.externalLyricsEnabled,
+                                    leadingIcon = { Icon(painterResource(R.drawable.rounded_lyrics_24), null, tint = MaterialTheme.colorScheme.secondary) }
+                                )
+                                SwitchSettingItem(
                                     title = stringResource(R.string.setcat_external_artist_images_title),
                                     subtitle = stringResource(R.string.setcat_external_artist_images_subtitle),
                                     checked = uiState.externalArtistImagesEnabled,

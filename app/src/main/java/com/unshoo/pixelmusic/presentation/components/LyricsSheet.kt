@@ -102,6 +102,8 @@ import androidx.compose.ui.unit.sp
 
 import com.unshoo.pixelmusic.data.model.SyncedLine
 import com.unshoo.pixelmusic.data.model.SyncedWord
+import com.unshoo.pixelmusic.presentation.components.wordsync.WordSyncedLineText
+import com.unshoo.pixelmusic.presentation.components.wordsync.buildWordSyncLine
 import com.unshoo.pixelmusic.data.repository.LyricsSearchResult
 import com.unshoo.pixelmusic.presentation.screens.TabAnimation
 import com.unshoo.pixelmusic.presentation.components.subcomps.FetchLyricsDialog
@@ -1524,15 +1526,14 @@ fun LyricLineRow(
             }
         }
     } else {
-        val wordVisualStates by remember(position, sanitizedWords, line.time, lineEndTime) {
-            derivedStateOf {
-                resolveWordVisualStates(
-                    words = requireNotNull(sanitizedWords),
-                    positionMs = position,
-                    lineStartTimeMs = line.time.toLong(),
-                    lineEndTimeMs = lineEndTime
-                )
-            }
+        // Word/syllable-accurate rendering (sweep inside each word, lift, bloom).
+        // Words without an end time borrow the start of the next one.
+        val wordSyncLine = remember(line.time, sanitizedWords, lineEndTime) {
+            buildWordSyncLine(
+                lineTimeMs = line.time.toLong(),
+                words = requireNotNull(sanitizedWords),
+                lineEndMs = lineEndTime
+            )
         }
 
         Column(
@@ -1543,30 +1544,20 @@ fun LyricLineRow(
                 .padding(vertical = verticalPadding, horizontal = 2.dp),
             horizontalAlignment = horizontalAlignment
         ) {
-            FlowRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = when (lyricsAlignment) {
-                    "center" -> Arrangement.spacedBy(3.dp, Alignment.CenterHorizontally)
-                    "right" -> Arrangement.spacedBy(3.dp, Alignment.End)
-                    else -> Arrangement.spacedBy(3.dp, Alignment.Start)
-                },
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                sanitizedWordClusters.forEach { cluster ->
-                    cluster.words.forEachIndexed { clusterOffset, word ->
-                        val wordIndex = cluster.startIndex + clusterOffset
-                        key("${line.time}_${word.time}_${word.word}_$wordIndex") {
-                            LyricWordSpan(
-                                word = word,
-                                visualState = wordVisualStates[wordIndex],
-                                motionEnabled = decorativeMotionEnabled,
-                                style = style,
-                                highlightedColor = accentColor,
-                                unhighlightedColor = unhighlightedColor
-                            )
-                        }
-                    }
-                }
+            if (wordSyncLine != null) {
+                WordSyncedLineText(
+                    line = wordSyncLine,
+                    positionMs = position,
+                    style = style,
+                    litColor = accentColor,
+                    dimColor = unhighlightedColor,
+                    textAlign = textAlign,
+                    boxAlignment = boxAlignment,
+                    feather = isCurrentLine,
+                    glowEnabled = decorativeMotionEnabled,
+                    riseEnabled = decorativeMotionEnabled,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
 
             if (showRomanization && !romanizationText.isNullOrBlank()) {

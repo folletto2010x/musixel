@@ -21,6 +21,7 @@ import com.unshoo.pixelmusic.data.preferences.UserPreferencesRepository
 import com.unshoo.pixelmusic.utils.LyricsImportSecurity
 import com.unshoo.pixelmusic.utils.LyricsImportValidationResult
 import com.unshoo.pixelmusic.utils.LogUtils
+import com.unshoo.pixelmusic.data.network.lyrics.LyricsPlusProvider
 import com.unshoo.pixelmusic.utils.LyricsUtils
 import com.unshoo.pixelmusic.utils.NetworkRetryUtils
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -419,6 +420,8 @@ class LyricsRepositoryImpl @Inject constructor(
             return@withContext cachedJson
         }
 
+        fetchWordSyncedFromLyricsPlus(song)?.let { return@withContext it }
+
         val currentTime = System.currentTimeMillis()
         val delayNeeded = calculateApiDelay("lrclib", currentTime)
         if (delayNeeded > 0) {
@@ -528,6 +531,48 @@ class LyricsRepositoryImpl @Inject constructor(
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "LRCLIB lyrics fetch failed: ${e.message}")
             return@withContext null
+        }
+    }
+
+    /**
+     * Syllable-synced lyrics from LyricsPlus, tried before LRCLIB when the user
+     * has opted in. Returns null when disabled or when no mirror has the track,
+     * and the caller carries on with LRCLIB.
+     */
+    private suspend fun fetchWordSyncedFromLyricsPlus(song: Song): Lyrics? {
+        if (!userPreferencesRepository.lyricsPlusEnabledFlow.first()) return null
+        return try {
+            val rawLyrics = LyricsPlusProvider.fetchRawLyrics(
+                client = okHttpClient,
+                title = song.title.trim(),
+                artist = song.displayArtist.trim(),
+                durationMs = song.duration,
+                album = song.album.takeIf { it.isNotBlank() }
+            )
+            if (rawLyrics.isNullOrBlank()) return null
+
+            val parsedLyrics = LyricsUtils.parseLyrics(rawLyrics).copy(areFromRemote = true)
+            if (!parsedLyrics.isValid()) return null
+            Timber.tag(TAG).d("LyricsPlus lyrics found for: ${song.displayArtist} - ${song.title}")
+
+            try {
+                lyricsDao.insert(
+                    com.unshoo.pixelmusic.data.database.LyricsEntity(
+                        songId = song.id.toLong(),
+                        content = rawLyrics,
+                        isSynced = !parsedLyrics.synced.isNullOrEmpty(),
+                        source = "remote"
+                    )
+                )
+            } catch (e: NumberFormatException) {
+                Timber.tag(TAG).w("Skipping database save for non-numeric song ID: ${song.id}. Lyrics will be cached in JSON.")
+            }
+            parsedLyrics
+        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Timber.tag(TAG).w("LyricsPlus lookup failed: ${e.message}")
+            null
         }
     }
 
@@ -923,7 +968,32 @@ class LyricsRepositoryImpl @Inject constructor(
         return String.format(Locale.US, "%02d:%02d.%02d", minutes, seconds, hundredths)
     }
 
+    /**
+     * Word-timed lines in Kugou style, `[start,dur]<offset,dur,0>word`, which
+     * unlike enhanced LRC keeps the end of every word and syllable.
+     */
+    private fun toKugouWordByWord(lines: List<SyncedLine>): String {
+        return lines.joinToString("\n") { line ->
+            val words = line.words
+            if (words.isNullOrEmpty()) {
+                "[${line.time},0]${line.line}"
+            } else {
+                val lineEnd = words.maxOf { maxOf(it.time, it.endTime ?: it.time) }
+                val body = words.mapIndexed { index, word ->
+                    val separator = if (index > 0 && word.startsNewWord) " " else ""
+                    val offset = (word.time - line.time).coerceAtLeast(0)
+                    val duration = ((word.endTime ?: word.time) - word.time).coerceAtLeast(0)
+                    "$separator<$offset,$duration,0>${word.word}"
+                }.joinToString("")
+                "[${line.time},${(lineEnd - line.time).coerceAtLeast(0)}]$body"
+            }
+        }
+    }
+
     private fun toWordByWordLrc(lines: List<SyncedLine>): String {
+        if (lines.any { line -> line.words?.any { it.endTime != null } == true }) {
+            return toKugouWordByWord(lines)
+        }
         return lines.joinToString("\n") { line ->
             val linePrefix = "[${formatTimestamp(line.time)}]"
             val words = line.words

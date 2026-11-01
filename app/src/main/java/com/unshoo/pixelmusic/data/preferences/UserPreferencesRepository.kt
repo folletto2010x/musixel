@@ -207,6 +207,7 @@ constructor(
         val LYRICS_SOURCE_PREFERENCE = stringPreferencesKey("lyrics_source_preference")
         val AUTO_SCAN_LRC_FILES = booleanPreferencesKey("auto_scan_lrc_files")
         val EXTERNAL_LYRICS_ENABLED = booleanPreferencesKey("external_lyrics_enabled")
+        val LYRICS_PLUS_ENABLED = booleanPreferencesKey("lyrics_plus_enabled")
         val EXTERNAL_ARTIST_IMAGES_ENABLED = booleanPreferencesKey("external_artist_images_enabled")
 
         val ALBUM_ART_QUALITY = stringPreferencesKey("album_art_quality")
@@ -596,6 +597,18 @@ constructor(
     suspend fun setLyricsSourcePreference(preference: LyricsSourcePreference) {
         dataStore.edit { preferences ->
             preferences[PreferencesKeys.LYRICS_SOURCE_PREFERENCE] = preference.name
+        }
+    }
+
+    /** Opt-in: syllable-synced lyrics from LyricsPlus mirrors (a third-party service). */
+    val lyricsPlusEnabledFlow: Flow<Boolean> =
+        dataStore.data.map { preferences ->
+            preferences[PreferencesKeys.LYRICS_PLUS_ENABLED] ?: false
+        }.distinctUntilChanged()
+
+    suspend fun setLyricsPlusEnabled(enabled: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[PreferencesKeys.LYRICS_PLUS_ENABLED] = enabled
         }
     }
 

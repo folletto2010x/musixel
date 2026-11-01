@@ -82,6 +82,7 @@ data class SettingsUiState(
     val lyricsSourcePreference: LyricsSourcePreference = LyricsSourcePreference.EMBEDDED_FIRST,
     val autoScanLrcFiles: Boolean = false,
     val externalLyricsEnabled: Boolean = false,
+    val lyricsPlusEnabled: Boolean = false,
     val externalArtistImagesEnabled: Boolean = false,
     val blockedDirectories: Set<String> = emptySet(),
     val appRebrandDialogShown: Boolean = false,
@@ -405,6 +406,12 @@ class SettingsViewModel @Inject constructor(
         }
 
         viewModelScope.launch {
+            userPreferencesRepository.lyricsPlusEnabledFlow.collect { enabled ->
+                _uiState.update { it.copy(lyricsPlusEnabled = enabled) }
+            }
+        }
+
+        viewModelScope.launch {
             userPreferencesRepository.externalArtistImagesEnabledFlow.collect { enabled ->
                 _uiState.update { it.copy(externalArtistImagesEnabled = enabled) }
             }
@@ -703,6 +710,12 @@ class SettingsViewModel @Inject constructor(
     fun setAutoScanLrcFiles(enabled: Boolean) {
         viewModelScope.launch {
             userPreferencesRepository.setAutoScanLrcFiles(enabled)
+        }
+    }
+
+    fun setLyricsPlusEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            userPreferencesRepository.setLyricsPlusEnabled(enabled)
         }
     }
 
