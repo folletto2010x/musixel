@@ -4,7 +4,9 @@ Writes app/src/main/res/values/strings_fallback_generated.xml with every
 string the code refers to but the default (values/) resources do not define.
 
 Source for each missing key, in order: the Turkish resources, any other
-locale, then the English texts in EXTRA below. Run from the repo root.
+locale, then the English texts in EXTRA below. Lists of strings (arrays) that
+no locale defines are written empty; their text is not made up. Run from the
+repo root.
 """
 import glob, os, re, sys
 
@@ -52,6 +54,8 @@ def definitions(directory):
             found[m.group(1)] = m.group(0)
         for m in re.finditer(r'<plurals\s+name="([^"]+)".*?</plurals>', text, re.S):
             found["plurals:" + m.group(1)] = m.group(0)
+        for m in re.finditer(r'<string-array\s+name="([^"]+)".*?</string-array>', text, re.S):
+            found["array:" + m.group(1)] = m.group(0)
     return found
 
 
@@ -61,8 +65,10 @@ def referenced():
         text = read(path)
         refs |= set(re.findall(r"R\.string\.([A-Za-z0-9_]+)", text))
         refs |= {"plurals:" + x for x in re.findall(r"R\.plurals\.([A-Za-z0-9_]+)", text)}
+        refs |= {"array:" + x for x in re.findall(r"R\.array\.([A-Za-z0-9_]+)", text)}
     for path in glob.glob(os.path.join(RES, "**", "*.xml"), recursive=True) + [os.path.join(SRC, "AndroidManifest.xml")]:
         refs |= set(re.findall(r"@string/([A-Za-z0-9_]+)", read(path)))
+        refs |= {"array:" + x for x in re.findall(r"@array/([A-Za-z0-9_]+)", read(path))}
     return refs
 
 
@@ -73,12 +79,15 @@ def main():
                if d.startswith("values-") and d != "values-night"}
     ordered = ["values-tr"] + [d for d in locales if d != "values-tr"]
 
-    lines, stats = [], {"copied": 0, "extra": 0, "unresolved": []}
+    lines, stats = [], {"copied": 0, "extra": 0, "empty": 0, "unresolved": []}
     for key in missing:
         element = next((locales[d][key] for d in ordered if key in locales.get(d, {})), None)
         if element is not None:
             stats["copied"] += 1
             lines.append("    " + element)
+        elif key.startswith("array:"):
+            stats["empty"] += 1
+            lines.append('    <string-array name="%s"></string-array>' % key[len("array:"):])
         elif key in EXTRA:
             stats["extra"] += 1
             lines.append('    <string name="%s">%s</string>' % (key, EXTRA[key]))
@@ -88,8 +97,8 @@ def main():
     with open(OUT, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n')
         f.write("\n".join(lines) + "\n</resources>\n")
-    print("referenced but undefined: %d | copied from other locales: %d | written here: %d | still unresolved: %d"
-          % (len(missing), stats["copied"], stats["extra"], len(stats["unresolved"])))
+    print("referenced but undefined: %d | copied from other locales: %d | written here: %d | empty lists: %d | still unresolved: %d"
+          % (len(missing), stats["copied"], stats["extra"], stats["empty"], len(stats["unresolved"])))
     if stats["unresolved"]:
         print("unresolved:", ", ".join(stats["unresolved"]))
         sys.exit(1)
