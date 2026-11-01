@@ -1,0 +1,53 @@
+herename: Apply word-sync patch and build APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Apply patch
+        run: |
+          git apply --check pixelmusic-wordsync.patch
+          git apply pixelmusic-wordsync.patch
+
+      - name: Save patched sources to branch wordsync
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout -b wordsync
+          git rm -q --cached pixelmusic-wordsync.patch
+          git add -A
+          git commit -q -m "Apply word-by-word lyrics patch"
+          git push --force origin wordsync
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v6.2.0
+
+      - name: Throwaway keystore
+        run: |
+          P="$(openssl rand -hex 24)"
+          keytool -genkey -v -keystore pixelplayeross-ci.jks -alias pixelplayeross-ci-key -keyalg RSA -keysize 4096 -validity 10000 -storepass "$P" -keypass "$P" -dname "CN=Musixel CI, OU=Dev, O=Musixel, L=World, S=World, C=US"
+          printf 'storeFile=pixelplayeross-ci.jks\nstorePassword=%s\nkeyAlias=pixelplayeross-ci-key\nkeyPassword=%s\n' "$P" "$P" > keystore.properties
+
+      - name: Build
+        run: ./gradlew :app:assembleRelease -Ppixelplayer.enableAbiSplits=true
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: musixel-wordsync-apk
+          path: |
+            app/build/outputs/apk/release/app-arm64-v8a-release.apk
+            app/build/outputs/apk/release/app-armeabi-v7a-release.apk
+          if-no-files-found: error
+          compression-level: 0
