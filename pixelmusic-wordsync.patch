@@ -1,0 +1,2072 @@
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/data/model/Lyrics.kt b/app/src/main/java/com/unshoo/pixelmusic/data/model/Lyrics.kt
+index 4fafce5..da42370 100644
+--- a/app/src/main/java/com/unshoo/pixelmusic/data/model/Lyrics.kt
++++ b/app/src/main/java/com/unshoo/pixelmusic/data/model/Lyrics.kt
+@@ -29,5 +29,7 @@ data class SyncedLine(
+ data class SyncedWord(
+     val time: Int,
+     val word: String,
+-    val startsNewWord: Boolean = true
++    val startsNewWord: Boolean = true,
++    /** When the word stops being sung, if the source says so; null = until the next word. */
++    val endTime: Int? = null
+ )
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/data/network/lyrics/LyricsPlusProvider.kt b/app/src/main/java/com/unshoo/pixelmusic/data/network/lyrics/LyricsPlusProvider.kt
+new file mode 100644
+index 0000000..d51543b
+--- /dev/null
++++ b/app/src/main/java/com/unshoo/pixelmusic/data/network/lyrics/LyricsPlusProvider.kt
+@@ -0,0 +1,269 @@
++package com.unshoo.pixelmusic.data.network.lyrics
++
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.selects.select
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import kotlinx.serialization.Serializable
++import kotlinx.serialization.json.Json
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import java.io.IOException
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicReference
++import kotlin.coroutines.resume
++
++/**
++ * Syllable-timed lyrics from LyricsPlus, the open backend behind the YouLy+
++ * extension (it aggregates Apple Music, QQ Music and Musixmatch).
++ *
++ * Based on BitChord's LyricsPlus provider
++ * (https://github.com/kushagrasinghx/BitChord, GPL-3.0), file
++ * shared/.../data/lyrics/LyricsPlus.kt, adapted for Pixel Music.
++ *
++ * The backend runs on volunteer-hosted mirrors, many of which are down at any
++ * given time. As in BitChord, every mirror is asked at once and the first
++ * usable answer wins; the winner is remembered for the next track.
++ *
++ * Title, artist, album and duration of the track are sent to those mirrors.
++ *
++ * The result is handed back as Kugou-style text (`[start,dur]<offset,dur,0>word`)
++ * which `LyricsUtils.parseLyrics` already understands and which, unlike
++ * enhanced LRC, keeps the end of every word and syllable.
++ */
++object LyricsPlusProvider {
++
++    private val MIRRORS = listOf(
++        "https://lyricsplus.prjktla.my.id",
++        "https://lyricsplus.atomix.one",
++        "https://lyricsplus.binimum.org",
++        "https://lyricsplus.prjktla.workers.dev",
++        "https://lyricsplus-seven.vercel.app",
++        "https://lyrics-plus-backend.vercel.app",
++    )
++
++    private const val USER_AGENT = "PixelMusic (https://github.com/ianshulyadav/PixelMusic)"
++    private const val TIMEOUT_SECONDS = 6L
++
++    /** A track whose last line starts this far past the song's end is another song. */
++    private const val DURATION_SLACK_MS = 15_000L
++
++    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
++    private val lastGood = AtomicReference<String?>(null)
++
++    /**
++     * Raw word/syllable-synced lyrics for the track, or null when no mirror has
++     * them. Never throws for network or parsing problems.
++     */
++    suspend fun fetchRawLyrics(
++        client: OkHttpClient,
++        title: String,
++        artist: String,
++        durationMs: Long,
++        album: String? = null,
++    ): String? = coroutineScope {
++        val fast = client.newBuilder()
++            .callTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .connectTimeout(3, TimeUnit.SECONDS)
++            .build()
++
++        val hosts = lastGood.get()
++            ?.let { listOf(it) + MIRRORS.filterNot { mirror -> mirror == it } }
++            ?: MIRRORS
++
++        val pending = hosts.map { host ->
++            host to async(Dispatchers.IO) { fetch(fast, host, title, artist, durationMs, album) }
++        }.toMutableList()
++
++        try {
++            while (pending.isNotEmpty()) {
++                val (host, raw) = select {
++                    pending.forEach { (host, job) -> job.onAwait { host to it } }
++                }
++                pending.removeAll { it.first == host }
++                if (!raw.isNullOrBlank()) {
++                    lastGood.set(host)
++                    return@coroutineScope raw
++                }
++            }
++            null
++        } finally {
++            pending.forEach { it.second.cancel() }
++        }
++    }
++
++    private suspend fun fetch(
++        client: OkHttpClient,
++        host: String,
++        title: String,
++        artist: String,
++        durationMs: Long,
++        album: String?,
++    ): String? = withContext(Dispatchers.IO) {
++        val url = runCatching {
++            "$host/v2/lyrics/get".toHttpUrl().newBuilder()
++                .addQueryParameter("title", title)
++                .addQueryParameter("artist", artist)
++                .apply {
++                    val seconds = durationMs / 1000
++                    if (seconds > 0) addQueryParameter("duration", seconds.toString())
++                    if (!album.isNullOrBlank()) addQueryParameter("album", album)
++                }
++                .build()
++        }.getOrNull() ?: return@withContext null
++
++        val request = Request.Builder().url(url)
++            .header("User-Agent", USER_AGENT)
++            .header("Accept", "application/json")
++            .build()
++
++        val body = client.newCall(request).awaitBody() ?: return@withContext null
++        val response = runCatching { json.decodeFromString<LyricsPlusResponse>(body) }.getOrNull()
++            ?: return@withContext null
++
++        toKugouLrc(
++            lines = response.lyrics.orEmpty().map { line ->
++                PlusLine(
++                    startMs = line.time,
++                    durationMs = line.duration,
++                    text = line.text,
++                    syllables = line.syllabus.orEmpty().mapNotNull { syllable ->
++                        val text = syllable.text ?: return@mapNotNull null
++                        val time = syllable.time ?: return@mapNotNull null
++                        PlusSyllable(time, syllable.duration ?: 0L, text)
++                    },
++                )
++            },
++            songDurationMs = durationMs,
++        )
++    }
++
++    /** Body of a successful call, or null for any failure. Cancels the call if the coroutine is cancelled. */
++    private suspend fun Call.awaitBody(): String? = suspendCancellableCoroutine { continuation ->
++        continuation.invokeOnCancellation { cancel() }
++        enqueue(object : Callback {
++            override fun onFailure(call: Call, e: IOException) {
++                if (continuation.isActive) continuation.resume(null)
++            }
++
++            override fun onResponse(call: Call, response: Response) {
++                val text = runCatching {
++                    response.use { if (it.isSuccessful) it.body?.string() else null }
++                }.getOrNull()
++                if (continuation.isActive) continuation.resume(text)
++            }
++        })
++    }
++
++    // ---------------------------------------------------------------------
++    // Conversion (pure, unit-testable)
++    // ---------------------------------------------------------------------
++
++    internal data class PlusSyllable(val startMs: Long, val durationMs: Long, val text: String)
++
++    internal data class PlusLine(
++        val startMs: Long?,
++        val durationMs: Long?,
++        val text: String?,
++        val syllables: List<PlusSyllable>,
++    )
++
++    /**
++     * Writes [lines] as Kugou-style text:
++     * `[lineStartMs,lineDurationMs]<offsetMs,durationMs,0>text...`
++     * where offsets are relative to the line start.
++     *
++     * A syllable keeps whatever whitespace the API gave it: that whitespace is
++     * the only thing saying where a word ends, and the parser reads it back as
++     * `startsNewWord`. Scripts written without spaces (Han, kana, Thai) get a
++     * boundary after every run, otherwise a whole line would become one word.
++     *
++     * Returns null when nothing usable is left, or when the lyrics run well
++     * past the end of the song (a different track).
++     */
++    internal fun toKugouLrc(lines: List<PlusLine>, songDurationMs: Long): String? {
++        val built = ArrayList<Pair<Long, String>>()
++        var lastStart = 0L
++
++        for (line in lines) {
++            val start = line.startMs ?: continue
++            // Blank runs stay in the text: a lone space is what ends a word.
++            val syllables = line.syllables
++            val timed = syllables.filter { it.text.isNotBlank() }
++            if (timed.isNotEmpty()) {
++                val lineStart = minOf(start, timed.minOf { it.startMs }).coerceAtLeast(0L)
++                val lineEnd = timed.maxOf { maxOf(it.startMs, it.startMs + it.durationMs) }
++                val body = StringBuilder()
++                syllables.forEachIndexed { index, syllable ->
++                    val offset = (syllable.startMs - lineStart).coerceAtLeast(0L)
++                    val duration = syllable.durationMs.coerceAtLeast(0L)
++                    var text = sanitize(syllable.text)
++                    val next = syllables.getOrNull(index + 1)?.text
++                    if (!text.last().isWhitespace() && needsBoundary(text.last(), next)) text += " "
++                    body.append('<').append(offset).append(',').append(duration).append(",0>").append(text)
++                }
++                built += lineStart to "[$lineStart,${(lineEnd - lineStart).coerceAtLeast(0L)}]$body"
++                lastStart = maxOf(lastStart, lineStart)
++            } else if (!line.text.isNullOrBlank()) {
++                // Line-synced only: still worth showing, without word timing.
++                val text = sanitize(line.text).trim()
++                if (text.isNotEmpty()) {
++                    built += start to "[$start,${(line.durationMs ?: 0L).coerceAtLeast(0L)}]$text"
++                    lastStart = maxOf(lastStart, start)
++                }
++            }
++        }
++
++        if (built.isEmpty()) return null
++        if (songDurationMs > 0 && lastStart > songDurationMs + DURATION_SLACK_MS) return null
++        // The format needs at least one timed word to be recognised as such.
++        if (built.none { it.second.contains("<") }) return null
++        return built.sortedBy { it.first }.joinToString("\n") { it.second }
++    }
++
++    /** Tags and line breaks inside a syllable would corrupt the text format. */
++    private fun sanitize(raw: String): String =
++        raw.replace('\n', ' ').replace('\r', ' ').replace("<", "").replace(">", "")
++            .ifBlank { " " }
++
++    private fun needsBoundary(last: Char, next: String?): Boolean {
++        if (next == null) return false
++        val first = next.firstOrNull() ?: return false
++        if (first.isWhitespace()) return false
++        return last.isUnspacedScript() || first.isUnspacedScript()
++    }
++
++    /** Scripts written without spaces between words. */
++    private fun Char.isUnspacedScript(): Boolean =
++        this in '\u3400'..'\u9FFF' ||
++            this in '\u3040'..'\u30FF' ||
++            this in '\u3000'..'\u303F' ||
++            this in '\uFF00'..'\uFFEF' ||
++            this in '\u0E00'..'\u0E7F'
++
++    @Serializable
++    private data class LyricsPlusResponse(
++        val lyrics: List<PlusJsonLine>? = null,
++    )
++
++    @Serializable
++    private data class PlusJsonLine(
++        val time: Long? = null,
++        val duration: Long? = null,
++        val text: String? = null,
++        val syllabus: List<PlusJsonSyllable>? = null,
++    )
++
++    @Serializable
++    private data class PlusJsonSyllable(
++        val time: Long? = null,
++        val duration: Long? = null,
++        val text: String? = null,
++    )
++}
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/data/preferences/UserPreferencesRepository.kt b/app/src/main/java/com/unshoo/pixelmusic/data/preferences/UserPreferencesRepository.kt
+index 8b815f1..652960c 100644
+--- a/app/src/main/java/com/unshoo/pixelmusic/data/preferences/UserPreferencesRepository.kt
++++ b/app/src/main/java/com/unshoo/pixelmusic/data/preferences/UserPreferencesRepository.kt
+@@ -207,6 +207,7 @@ constructor(
+         val LYRICS_SOURCE_PREFERENCE = stringPreferencesKey("lyrics_source_preference")
+         val AUTO_SCAN_LRC_FILES = booleanPreferencesKey("auto_scan_lrc_files")
+         val EXTERNAL_LYRICS_ENABLED = booleanPreferencesKey("external_lyrics_enabled")
++        val LYRICS_PLUS_ENABLED = booleanPreferencesKey("lyrics_plus_enabled")
+         val EXTERNAL_ARTIST_IMAGES_ENABLED = booleanPreferencesKey("external_artist_images_enabled")
+ 
+         val ALBUM_ART_QUALITY = stringPreferencesKey("album_art_quality")
+@@ -599,6 +600,18 @@ constructor(
+         }
+     }
+ 
++    /** Opt-in: syllable-synced lyrics from LyricsPlus mirrors (a third-party service). */
++    val lyricsPlusEnabledFlow: Flow<Boolean> =
++        dataStore.data.map { preferences ->
++            preferences[PreferencesKeys.LYRICS_PLUS_ENABLED] ?: false
++        }.distinctUntilChanged()
++
++    suspend fun setLyricsPlusEnabled(enabled: Boolean) {
++        dataStore.edit { preferences ->
++            preferences[PreferencesKeys.LYRICS_PLUS_ENABLED] = enabled
++        }
++    }
++
+     val externalLyricsEnabledFlow: Flow<Boolean> =
+             dataStore.data.map { preferences ->
+                 preferences[PreferencesKeys.EXTERNAL_LYRICS_ENABLED] ?: false
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/data/repository/LyricsRepositoryImpl.kt b/app/src/main/java/com/unshoo/pixelmusic/data/repository/LyricsRepositoryImpl.kt
+index 4ac529e..387b7b2 100644
+--- a/app/src/main/java/com/unshoo/pixelmusic/data/repository/LyricsRepositoryImpl.kt
++++ b/app/src/main/java/com/unshoo/pixelmusic/data/repository/LyricsRepositoryImpl.kt
+@@ -21,6 +21,7 @@ import com.unshoo.pixelmusic.data.preferences.UserPreferencesRepository
+ import com.unshoo.pixelmusic.utils.LyricsImportSecurity
+ import com.unshoo.pixelmusic.utils.LyricsImportValidationResult
+ import com.unshoo.pixelmusic.utils.LogUtils
++import com.unshoo.pixelmusic.data.network.lyrics.LyricsPlusProvider
+ import com.unshoo.pixelmusic.utils.LyricsUtils
+ import com.unshoo.pixelmusic.utils.NetworkRetryUtils
+ import dagger.hilt.android.qualifiers.ApplicationContext
+@@ -419,6 +420,8 @@ class LyricsRepositoryImpl @Inject constructor(
+             return@withContext cachedJson
+         }
+ 
++        fetchWordSyncedFromLyricsPlus(song)?.let { return@withContext it }
++
+         val currentTime = System.currentTimeMillis()
+         val delayNeeded = calculateApiDelay("lrclib", currentTime)
+         if (delayNeeded > 0) {
+@@ -531,6 +534,48 @@ class LyricsRepositoryImpl @Inject constructor(
+         }
+     }
+ 
++    /**
++     * Syllable-synced lyrics from LyricsPlus, tried before LRCLIB when the user
++     * has opted in. Returns null when disabled or when no mirror has the track,
++     * and the caller carries on with LRCLIB.
++     */
++    private suspend fun fetchWordSyncedFromLyricsPlus(song: Song): Lyrics? {
++        if (!userPreferencesRepository.lyricsPlusEnabledFlow.first()) return null
++        return try {
++            val rawLyrics = LyricsPlusProvider.fetchRawLyrics(
++                client = okHttpClient,
++                title = song.title.trim(),
++                artist = song.displayArtist.trim(),
++                durationMs = song.duration,
++                album = song.album.takeIf { it.isNotBlank() }
++            )
++            if (rawLyrics.isNullOrBlank()) return null
++
++            val parsedLyrics = LyricsUtils.parseLyrics(rawLyrics).copy(areFromRemote = true)
++            if (!parsedLyrics.isValid()) return null
++            Timber.tag(TAG).d("LyricsPlus lyrics found for: ${song.displayArtist} - ${song.title}")
++
++            try {
++                lyricsDao.insert(
++                    com.unshoo.pixelmusic.data.database.LyricsEntity(
++                        songId = song.id.toLong(),
++                        content = rawLyrics,
++                        isSynced = !parsedLyrics.synced.isNullOrEmpty(),
++                        source = "remote"
++                    )
++                )
++            } catch (e: NumberFormatException) {
++                Timber.tag(TAG).w("Skipping database save for non-numeric song ID: ${song.id}. Lyrics will be cached in JSON.")
++            }
++            parsedLyrics
++        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            Timber.tag(TAG).w("LyricsPlus lookup failed: ${e.message}")
++            null
++        }
++    }
++
+     private fun hasLyrics(response: LrcLibResponse): Boolean =
+         !response.plainLyrics.isNullOrBlank() || response.hasSyncedContent
+ 
+@@ -923,7 +968,32 @@ class LyricsRepositoryImpl @Inject constructor(
+         return String.format(Locale.US, "%02d:%02d.%02d", minutes, seconds, hundredths)
+     }
+ 
++    /**
++     * Word-timed lines in Kugou style, `[start,dur]<offset,dur,0>word`, which
++     * unlike enhanced LRC keeps the end of every word and syllable.
++     */
++    private fun toKugouWordByWord(lines: List<SyncedLine>): String {
++        return lines.joinToString("\n") { line ->
++            val words = line.words
++            if (words.isNullOrEmpty()) {
++                "[${line.time},0]${line.line}"
++            } else {
++                val lineEnd = words.maxOf { maxOf(it.time, it.endTime ?: it.time) }
++                val body = words.mapIndexed { index, word ->
++                    val separator = if (index > 0 && word.startsNewWord) " " else ""
++                    val offset = (word.time - line.time).coerceAtLeast(0)
++                    val duration = ((word.endTime ?: word.time) - word.time).coerceAtLeast(0)
++                    "$separator<$offset,$duration,0>${word.word}"
++                }.joinToString("")
++                "[${line.time},${(lineEnd - line.time).coerceAtLeast(0)}]$body"
++            }
++        }
++    }
++
+     private fun toWordByWordLrc(lines: List<SyncedLine>): String {
++        if (lines.any { line -> line.words?.any { it.endTime != null } == true }) {
++            return toKugouWordByWord(lines)
++        }
+         return lines.joinToString("\n") { line ->
+             val linePrefix = "[${formatTimestamp(line.time)}]"
+             val words = line.words
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/presentation/components/LyricsSheet.kt b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/LyricsSheet.kt
+index de96d76..562428e 100644
+--- a/app/src/main/java/com/unshoo/pixelmusic/presentation/components/LyricsSheet.kt
++++ b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/LyricsSheet.kt
+@@ -102,6 +102,8 @@ import androidx.compose.ui.unit.sp
+ 
+ import com.unshoo.pixelmusic.data.model.SyncedLine
+ import com.unshoo.pixelmusic.data.model.SyncedWord
++import com.unshoo.pixelmusic.presentation.components.wordsync.WordSyncedLineText
++import com.unshoo.pixelmusic.presentation.components.wordsync.buildWordSyncLine
+ import com.unshoo.pixelmusic.data.repository.LyricsSearchResult
+ import com.unshoo.pixelmusic.presentation.screens.TabAnimation
+ import com.unshoo.pixelmusic.presentation.components.subcomps.FetchLyricsDialog
+@@ -1524,15 +1526,14 @@ fun LyricLineRow(
+             }
+         }
+     } else {
+-        val wordVisualStates by remember(position, sanitizedWords, line.time, lineEndTime) {
+-            derivedStateOf {
+-                resolveWordVisualStates(
+-                    words = requireNotNull(sanitizedWords),
+-                    positionMs = position,
+-                    lineStartTimeMs = line.time.toLong(),
+-                    lineEndTimeMs = lineEndTime
+-                )
+-            }
++        // Word/syllable-accurate rendering (sweep inside each word, lift, bloom).
++        // Words without an end time borrow the start of the next one.
++        val wordSyncLine = remember(line.time, sanitizedWords, lineEndTime) {
++            buildWordSyncLine(
++                lineTimeMs = line.time.toLong(),
++                words = requireNotNull(sanitizedWords),
++                lineEndMs = lineEndTime
++            )
+         }
+ 
+         Column(
+@@ -1543,30 +1544,20 @@ fun LyricLineRow(
+                 .padding(vertical = verticalPadding, horizontal = 2.dp),
+             horizontalAlignment = horizontalAlignment
+         ) {
+-            FlowRow(
+-                modifier = Modifier.fillMaxWidth(),
+-                horizontalArrangement = when (lyricsAlignment) {
+-                    "center" -> Arrangement.spacedBy(3.dp, Alignment.CenterHorizontally)
+-                    "right" -> Arrangement.spacedBy(3.dp, Alignment.End)
+-                    else -> Arrangement.spacedBy(3.dp, Alignment.Start)
+-                },
+-                verticalArrangement = Arrangement.spacedBy(4.dp)
+-            ) {
+-                sanitizedWordClusters.forEach { cluster ->
+-                    cluster.words.forEachIndexed { clusterOffset, word ->
+-                        val wordIndex = cluster.startIndex + clusterOffset
+-                        key("${line.time}_${word.time}_${word.word}_$wordIndex") {
+-                            LyricWordSpan(
+-                                word = word,
+-                                visualState = wordVisualStates[wordIndex],
+-                                motionEnabled = decorativeMotionEnabled,
+-                                style = style,
+-                                highlightedColor = accentColor,
+-                                unhighlightedColor = unhighlightedColor
+-                            )
+-                        }
+-                    }
+-                }
++            if (wordSyncLine != null) {
++                WordSyncedLineText(
++                    line = wordSyncLine,
++                    positionMs = position,
++                    style = style,
++                    litColor = accentColor,
++                    dimColor = unhighlightedColor,
++                    textAlign = textAlign,
++                    boxAlignment = boxAlignment,
++                    feather = isCurrentLine,
++                    glowEnabled = decorativeMotionEnabled,
++                    riseEnabled = decorativeMotionEnabled,
++                    modifier = Modifier.fillMaxWidth()
++                )
+             }
+ 
+             if (showRomanization && !romanizationText.isNullOrBlank()) {
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncAdapter.kt b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncAdapter.kt
+new file mode 100644
+index 0000000..71bef06
+--- /dev/null
++++ b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncAdapter.kt
+@@ -0,0 +1,81 @@
++package com.unshoo.pixelmusic.presentation.components.wordsync
++
++import com.unshoo.pixelmusic.data.model.SyncedWord
++
++/**
++ * How long the last word of a line is assumed to last when nothing states its
++ * end. Without a cap it would be stretched to the next line's start, and the
++ * sweep would crawl across the whole instrumental gap.
++ */
++private const val LAST_WORD_FALLBACK_MS = 1_200L
++
++/**
++ * Builds a [LyricLine] (the model the word-synced renderer draws) from Pixel
++ * Music's [SyncedWord]s.
++ *
++ * [words] must already be sanitized (see `sanitizeSyncedWords` in LyricsSheet).
++ *
++ * - A word's end is its own [SyncedWord.endTime] when the provider gave one,
++ *   otherwise the start of the next piece, otherwise [LAST_WORD_FALLBACK_MS]
++ *   after its start (never past [lineEndMs]).
++ * - Pieces with `startsNewWord == false` are syllables of the word before
++ *   them: they are glued into one [LyricWord] that keeps their own timing.
++ *
++ * Returns null when there is nothing to draw.
++ */
++internal fun buildWordSyncLine(
++    lineTimeMs: Long,
++    words: List<SyncedWord>,
++    lineEndMs: Long,
++): LyricLine? {
++    if (words.isEmpty()) return null
++
++    val ends = LongArray(words.size) { index ->
++        val start = words[index].time.toLong()
++        val stated = words[index].endTime?.toLong()
++        val next = words.getOrNull(index + 1)?.time?.toLong()
++        val end = stated
++            ?: next
++            ?: minOf(lineEndMs.coerceAtLeast(start), start + LAST_WORD_FALLBACK_MS)
++        maxOf(start, end)
++    }
++
++    val built = ArrayList<LyricWord>()
++    var from = 0
++    while (from < words.size) {
++        var to = from + 1
++        while (to < words.size && !words[to].startsNewWord) to++
++
++        val text = StringBuilder()
++        val parts = ArrayList<LyricSyllable>()
++        var end = ends[from]
++        for (index in from until to) {
++            val startChar = text.length
++            text.append(words[index].word)
++            parts += LyricSyllable(
++                startMs = words[index].time.toLong(),
++                endMs = ends[index],
++                startChar = startChar,
++                endChar = text.length,
++            )
++            end = maxOf(end, ends[index])
++        }
++        if (text.isNotEmpty()) {
++            val joined = text.toString()
++            built += LyricWord(
++                startMs = words[from].time.toLong(),
++                endMs = end,
++                text = joined,
++                syllables = LyricSyllable.normalized(parts, joined.length),
++            )
++        }
++        from = to
++    }
++    if (built.isEmpty()) return null
++
++    return LyricLine(
++        timeMs = minOf(lineTimeMs, built.first().startMs),
++        text = built.joinToString(" ") { it.text },
++        words = built,
++    )
++}
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncModel.kt b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncModel.kt
+new file mode 100644
+index 0000000..9e76b39
+--- /dev/null
++++ b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncModel.kt
+@@ -0,0 +1,622 @@
++package com.unshoo.pixelmusic.presentation.components.wordsync
++
++/*
++ * Word/syllable-synced lyric model and "held word" animation maths.
++ *
++ * Ported from BitChord (https://github.com/kushagrasinghx/BitChord,
++ * GPL-3.0), file shared/.../data/lyrics/LyricLine.kt, adapted for Pixel Music:
++ * duet alignment, background vocals and translation timing were left out.
++ */
++
++/**
++ * One word of a line, with the stretch of the song it is sung over.
++ *
++ * Apple's TTML splits long words into syllables. The word is still the unit
++ * the line is laid out, lifted and lit in — "e" and "nough" are one word on
++ * screen — so [startMs] is the first syllable's start and [endMs] the last
++ * one's end. But the syllables keep their own timing in [syllables], and the
++ * sweep follows those: "e" is clipped and "nough" is held, and a wipe spread
++ * evenly over the pair runs ahead of the first half and behind the second.
++ *
++ * Empty for a word nobody split, which is most of them — the word is then its
++ * own single syllable.
++ */
++data class LyricWord(
++    val startMs: Long,
++    val endMs: Long,
++    val text: String,
++    val syllables: List<LyricSyllable> = emptyList(),
++) {
++    /**
++     * How many of [text]'s characters have been sung at [positionMs], as a
++     * fraction. Each syllable fills its own characters over its own time, and
++     * a pause between two of them rests on the boundary rather than creeping
++     * into the next one before it is sung.
++     */
++    fun charsSungAt(positionMs: Long): Float {
++        if (positionMs <= startMs) return 0f
++        if (positionMs >= endMs) return text.length.toFloat()
++        if (syllables.isEmpty()) {
++            val span = (endMs - startMs).coerceAtLeast(1L)
++            return (positionMs - startMs).toFloat() / span * text.length
++        }
++        for (syllable in syllables) {
++            if (positionMs < syllable.startMs) return syllable.startChar.toFloat()
++            if (positionMs < syllable.endMs) {
++                val span = (syllable.endMs - syllable.startMs).coerceAtLeast(1L)
++                val through = (positionMs - syllable.startMs).toFloat() / span
++                return syllable.startChar + through * (syllable.endChar - syllable.startChar)
++            }
++        }
++        return text.length.toFloat()
++    }
++
++    /**
++     * This word with every character [drop] matches taken out of its text, and
++     * the syllables moved to keep covering the same letters. Null if nothing
++     * is left.
++     */
++    fun withoutChars(drop: (Char) -> Boolean): LyricWord? {
++        if (text.none(drop)) return this
++        // Where each old offset lands once the dropped characters are gone.
++        val moved = IntArray(text.length + 1)
++        val kept = StringBuilder()
++        text.forEachIndexed { index, char ->
++            moved[index] = kept.length
++            if (!drop(char)) kept.append(char)
++        }
++        moved[text.length] = kept.length
++        val lead = kept.indexOfFirst { !it.isWhitespace() }.takeIf { it >= 0 } ?: return null
++        val trimmed = kept.toString().trim()
++        val parts = syllables.map {
++            LyricSyllable(
++                startMs = it.startMs,
++                endMs = it.endMs,
++                startChar = (moved[it.startChar] - lead).coerceAtLeast(0),
++                endChar = (moved[it.endChar] - lead).coerceAtMost(trimmed.length),
++            )
++        }
++        return copy(text = trimmed, syllables = LyricSyllable.normalized(parts, trimmed.length))
++    }
++}
++
++/**
++ * One separately timed piece of a [LyricWord]: the characters [startChar]
++ * until [endChar] of the word's text, sung from [startMs] to [endMs].
++ */
++data class LyricSyllable(
++    val startMs: Long,
++    val endMs: Long,
++    val startChar: Int,
++    val endChar: Int,
++) {
++    companion object {
++        /**
++         * Tidies a word's syllables, as a parser collected them, into what
++         * [LyricWord.charsSungAt] expects: in order, end to end with no
++         * characters between them, and covering the whole of a
++         * [length]-character word. Punctuation hanging off the last syllable
++         * belongs to it, and an untimed apostrophe between two goes to the
++         * first.
++         *
++         * Empty when there is nothing to split — one syllable is just the word.
++         */
++        fun normalized(parts: List<LyricSyllable>, length: Int): List<LyricSyllable> {
++            val usable = parts
++                .filter { it.endChar > it.startChar && it.startChar < length }
++                .sortedBy { it.startChar }
++            if (usable.size < 2) return emptyList()
++            return usable.mapIndexed { index, part ->
++                LyricSyllable(
++                    startMs = part.startMs,
++                    endMs = maxOf(part.startMs, part.endMs),
++                    startChar = if (index == 0) 0 else part.startChar,
++                    endChar = usable.getOrNull(index + 1)?.startChar ?: length,
++                )
++            }
++        }
++    }
++}
++
++/**
++ * One synced line. [timeMs] is when it starts.
++ *
++ * [words] carries the word-level timing (each word with its own end, and its
++ * syllables where the provider split them). A line without words highlights
++ * whole; see [isWordSynced].
++ *
++ * [sungUntilMs] is the line's own end where one is known.
++ */
++data class LyricLine(
++    val timeMs: Long,
++    val text: String,
++    val words: List<LyricWord> = emptyList(),
++    val sungUntilMs: Long? = null,
++) {
++    val isGap: Boolean get() = text.isEmpty()
++
++    val isWordSynced: Boolean get() = words.isNotEmpty()
++
++    /**
++     * Where each of [words] sits in [text], as character ranges.
++     *
++     * Walked from where the last one ended rather than searched from the start,
++     * so a word repeated in the line lines up with its own occurrence — the
++     * same walk [revealedChars] does, kept once because the rise reads it on
++     * every frame of the line being sung rather than once as it passes.
++     */
++    val wordSpans: List<IntRange> by lazy(LazyThreadSafetyMode.NONE) {
++        var offset = 0
++        words.map { word ->
++            val start = text.indexOf(word.text, offset).takeIf { it >= 0 } ?: offset
++            val end = start + word.text.length
++            offset = end
++            start until end
++        }
++    }
++
++    /**
++     * Where each separately timed piece of the line sits in [text]: a word's
++     * syllables where the provider split it, the word itself where it did not.
++     * The sweep crosses each of these at a steady pace of its own.
++     */
++    val sweepSpans: List<IntRange> by lazy(LazyThreadSafetyMode.NONE) {
++        words.flatMapIndexed { index, word ->
++            val span = wordSpans[index]
++            if (word.syllables.isEmpty()) {
++                listOf(span)
++            } else {
++                word.syllables.map { (span.first + it.startChar) until (span.first + it.endChar) }
++            }
++        }
++    }
++
++    /**
++     * Whether anything on this line is off the floor at [positionMs].
++     *
++     * Two comparisons, so the lines that are not being sung — which is every
++     * line but one, on every frame — settle the question without walking their
++     * words to find out that none of them have moved.
++     */
++    fun isLifted(positionMs: Long): Boolean {
++        val first = words.firstOrNull() ?: return false
++        if (positionMs <= first.startMs) return false
++        // A word animated letter by letter runs on past the ordinary fall — its
++        // last letter only starts moving as the word ends. Stopping at the fall
++        // would drop that letter back to the line mid-swell.
++        return positionMs < words.last().endMs + RISE_MS || isGrowing(positionMs)
++    }
++
++    /**
++     * The stretch of the song over which anything drawn for this line moves —
++     * the sweep, the lift and its settle, a held word's letters — from
++     * [animatesFromMs] to [animatesUntilMs]. Before it the line is drawn
++     * unsung, after it sung and at rest, and either way exactly the same on
++     * every frame.
++     *
++     * Which is what lets a line outside it stop listening to the clock. Every
++     * line on screen reading it redrew on every frame of playback — and the
++     * blur on the lines away from the playing one then had to be worked out
++     * again each time, for a picture that had not changed.
++     */
++    val animatesFromMs: Long by lazy(LazyThreadSafetyMode.NONE) {
++        minOf(timeMs, words.firstOrNull()?.startMs ?: timeMs)
++    }
++
++    /** See [animatesFromMs]. */
++    val animatesUntilMs: Long by lazy(LazyThreadSafetyMode.NONE) {
++        val settled = words.lastOrNull()?.let { it.endMs + RISE_MS.toLong() } ?: endMs
++        val grown = growingWords.maxOfOrNull { it.restsAtMs } ?: Long.MIN_VALUE
++        maxOf(endMs, settled, grown)
++    }
++
++    /**
++     * How far the word covering [positionMs] has lifted, 0..1.
++     *
++     * Apple Music's words don't only light up, they rise as they land and
++     * settle back once they are past — the lift travelling along the line is
++     * most of what separates singing from a bar sliding across the text.
++     *
++     * How high a word goes is set by how long it is held — see [liftHeight]:
++     * patter barely leaves the line and a carried note goes all the way up,
++     * the same "a note carried is worth more than a note rattled off" that
++     * shapes the glow. It rises over its own length, so a quick word's small
++     * lift is also a quick one, and settles back over [RISE_MS] from its end.
++     */
++    fun wordLift(index: Int, positionMs: Long): Float {
++        val word = words.getOrNull(index) ?: return 0f
++        val riseMs = (word.endMs - word.startMs).toFloat().coerceIn(RISE_MIN_MS, RISE_MS)
++        val rising = ((positionMs - word.startMs) / riseMs).coerceIn(0f, 1f)
++        val falling = (1f - (positionMs - word.endMs) / RISE_MS).coerceIn(0f, 1f)
++        return liftHeight(word) * smooth(minOf(rising, falling))
++    }
++
++    /**
++     * Whether anything actually told us when the singing stops, rather than
++     * only when it starts. Word timings carry it, and so does a provider that
++     * stamps the line's own end ([sungUntilMs]).
++     *
++     * The distance to the next line's stamp is *not* evidence of an end: that
++     * distance is the line's own slot, and on a line-synced source it is
++     * routinely ten seconds for a line sung over all ten of them.
++     */
++    val hasKnownEnd: Boolean get() = words.isNotEmpty() || sungUntilMs != null
++
++    /**
++     * When the last word finishes — or the line's own end where the provider
++     * gave one, or [timeMs] when nothing did. Check [hasKnownEnd] before
++     * reading a silence out of this.
++     */
++    val endMs: Long
++        get() = words.lastOrNull()?.endMs ?: sungUntilMs ?: timeMs
++
++    /**
++     * How far through the line the singing has got, 0..1, as a fractional
++     * index into [text]. The sweep reveals up to this character.
++     *
++     * Within a word it interpolates across that word's own span, so a held
++     * note draws slowly and a rattled-off one snaps. Whitespace between two
++     * words is credited to the gap between them: it fills as the singer moves
++     * on rather than jumping ahead of the next word's first letter.
++     */
++    fun revealedChars(positionMs: Long): Float {
++        if (words.isEmpty()) return if (positionMs >= timeMs) text.length.toFloat() else 0f
++        var offset = 0
++        words.forEachIndexed { index, word ->
++            // Where this word sits in [text]. Built by walking rather than
++            // searching, so a word repeated in the line still lines up.
++            val start = text.indexOf(word.text, offset).takeIf { it >= 0 } ?: offset
++            val end = start + word.text.length
++            if (positionMs < word.startMs) return start.toFloat()
++            if (positionMs < word.endMs) return start + word.charsSungAt(positionMs)
++            // Past this word: the trailing space fills over the pause before
++            // the next one, so the highlight keeps creeping instead of resting
++            // on the word's last letter.
++            val next = words.getOrNull(index + 1)
++            if (next != null && positionMs < next.startMs) {
++                val gapStart = text.indexOf(next.text, end).takeIf { it >= 0 } ?: end
++                val pause = (next.startMs - word.endMs).coerceAtLeast(1L)
++                val through = (positionMs - word.endMs).toFloat() / pause
++                return end + through * (gapStart - end)
++            }
++            offset = end
++        }
++        return text.length.toFloat()
++    }
++
++    /**
++     * How much of a word's lift is left at [positionMs] — its full
++     * [liftHeight] while it is being sung, easing to 0 over [RISE_MS] once it
++     * is past. Carries the height so a letter-by-letter word comes to rest at
++     * exactly the lift [wordLift] hands it over to.
++     *
++     * Split out of [wordLift] because a word animated letter by letter has its
++     * own way up but settles back down the same way every other word does; the
++     * fall is the half of the movement the two share.
++     */
++    fun wordFall(index: Int, positionMs: Long): Float {
++        val word = words.getOrNull(index) ?: return 0f
++        val falling = (1f - (positionMs - word.endMs) / RISE_MS).coerceIn(0f, 1f)
++        return liftHeight(word) * smooth(falling)
++    }
++
++    /**
++     * The words held long enough to be worth animating letter by letter.
++     *
++     * A word carried for a second and a half is the one moment in a line where
++     * there is time to see anything happen to it, and drawing it the same as
++     * the syllables either side wastes that: it is what makes a held note in
++     * "golden hour" read as a pause in the highlight rather than as the singer
++     * holding on. Each letter of one swells, lifts and lights in turn — see
++     * [GrowingWord] for the shape of it.
++     *
++     * Rare by design. Most lines have none at all and pay a walk of their words
++     * once, on the first frame they are drawn.
++     */
++    val growingWords: List<GrowingWord> by lazy(LazyThreadSafetyMode.NONE) {
++        words.mapIndexedNotNull { index, word ->
++            if (word.canGrow()) GrowingWord(index, word) else null
++        }
++    }
++
++    /** The letter-by-letter treatment for word [index], where it has earned one. */
++    fun growingAt(index: Int): GrowingWord? =
++        growingWords.firstOrNull { it.index == index }
++
++    /**
++     * Whether any word on this line is mid-flight at [positionMs]. Answered
++     * without touching the words themselves, so the lines that have no held
++     * word — which is most of them — settle it in a comparison.
++     */
++    fun isGrowing(positionMs: Long): Boolean = growingWords.any {
++        positionMs >= it.startMs && positionMs <= it.restsAtMs
++    }
++}
++
++/**
++ * One word held long enough to be animated a letter at a time.
++ *
++ * Every letter runs the same three-beat move — swell up and forward, hold, then
++ * settle back to the small lift every sung word carries — but each one starts
++ * [GROW_STAGGER] of the word's own length after the one before it, so the
++ * movement travels along the word instead of the whole thing pulsing at once.
++ *
++ * The peaks differ letter by letter as well. Later letters of a long word, and
++ * every letter of a word that is only just held long enough to qualify, move
++ * and light less: without that a seven-letter word read as a wave with a tail
++ * that kept going after the singer had stopped.
++ *
++ * Peaks are precomputed here because they depend only on the word — its length
++ * and how long it is held — while the frame only ever asks where in the move a
++ * given letter has got to.
++ */
++class GrowingWord internal constructor(
++    /** Which of the line's words this is. */
++    val index: Int,
++    word: LyricWord,
++) {
++    val startMs: Long = word.startMs
++    val endMs: Long = word.endMs
++
++    private val chars: Int = word.text.length
++    private val scalePeak = FloatArray(chars)
++    private val shiftPeak = FloatArray(chars)
++    private val risePeak = FloatArray(chars)
++    private val bloomPeak = FloatArray(chars)
++
++    /** When the last letter has finished moving and is just sitting lifted. */
++    val restsAtMs: Long
++
++    init {
++        val held = (endMs - startMs).coerceAtLeast(1L).toFloat()
++        // How much of the full treatment this word has earned. Cubed, so the
++        // difference between a word held for a second and one held for three is
++        // most of the range and everything under a second is barely anything —
++        // the alternative reads as every word twitching.
++        val earned = ((held - GROW_RAMP_MIN_MS) / (GROW_RAMP_MAX_MS - GROW_RAMP_MIN_MS))
++            .coerceIn(0f, 1f)
++            .let { it * it * it }
++        val decay = decayRate(chars, held)
++        // A word barely over the line glows less than one held twice as long,
++        // and a long word spreads what it has over more letters.
++        val bloomPace = minOf(GROW_BLOOM_PACE_MAX, held / GROW_BLOOM_PACE_MS)
++        val bloomSpread = when {
++            chars <= 3 -> GROW_BLOOM_SHORT
++            chars >= 6 -> GROW_BLOOM_LONG
++            else -> 1f
++        }
++        // Short words swell a little more, having fewer letters to do it with.
++        val base = if (chars <= 3) GROW_BASE_SHORT else GROW_BASE_LONG
++        val liftPace = (held / GROW_LIFT_PACE_MS).coerceIn(GROW_LIFT_FLOOR, 1f)
++
++        for (i in 0 until chars) {
++            val place = if (chars > 1) i.toFloat() / (chars - 1) else 0f
++            val reach = earned * (1f - place * decay)
++            val scale = 1f + base + reach * GROW_SCALE_RANGE
++            scalePeak[i] = scale * GROW_SCALE_TRIM
++            bloomPeak[i] = (GROW_BLOOM_FLOOR + reach * GROW_BLOOM_RANGE) * bloomPace * bloomSpread
++            // The lift is read off the swell rather than set on its own: a
++            // letter that grows more rises further, which is what keeps the two
++            // reading as one movement instead of two.
++            risePeak[i] = ((scale - 1f) / GROW_SCALE_CEILING) * liftPace
++            // Letters lean away from the middle of the word as it swells, so it
++            // opens outwards rather than every letter sliding the same way.
++            val centre = (i + 0.5f) / chars
++            shiftPeak[i] = (centre - 0.5f) * 2f * (scale - 1f) * GROW_SHIFT_EM * GROW_SCALE_TRIM
++        }
++
++        val last = (chars - 1).coerceAtLeast(0) * GROW_STAGGER + GROW_SPAN
++        restsAtMs = startMs + (held * last).toLong()
++    }
++
++    /**
++     * Where letter [charIndex] has got to at [positionMs], written into [into]
++     * rather than returned: this runs for every letter of the word on every
++     * frame, three times over — dim copy, lit copy and bloom — and a line's
++     * worth of short-lived objects per frame is a cost with nothing to show
++     * for it.
++     *
++     * [CharGrowth.rise] comes back in multiples of the ordinary sung-word lift,
++     * and [CharGrowth.shift] in ems, so the caller converts once with the font
++     * size it is actually drawing at.
++     */
++    fun sampleInto(charIndex: Int, positionMs: Long, into: CharGrowth) {
++        val span = (endMs - startMs).coerceAtLeast(1L).toFloat()
++        val elapsed = positionMs - startMs - charIndex * span * GROW_STAGGER
++        val phase = (elapsed / (span * GROW_SPAN)).coerceIn(0f, 1f)
++        val peakScale = scalePeak[charIndex]
++        when {
++            phase < GROW_IN -> {
++                val t = smooth(phase / GROW_IN)
++                into.scale = 1f + (peakScale - 1f) * t
++                into.shift = shiftPeak[charIndex] * t
++                into.rise = risePeak[charIndex] * t
++                into.bloom = bloomPeak[charIndex] * t
++            }
++            phase < GROW_HOLD -> {
++                into.scale = peakScale
++                into.shift = shiftPeak[charIndex]
++                into.rise = risePeak[charIndex]
++                into.bloom = bloomPeak[charIndex]
++            }
++            phase < GROW_OUT -> {
++                val t = smooth((phase - GROW_HOLD) / (GROW_OUT - GROW_HOLD))
++                into.scale = peakScale + (1f - peakScale) * t
++                into.shift = shiftPeak[charIndex] * (1f - t)
++                into.rise = risePeak[charIndex] + (GROW_REST - risePeak[charIndex]) * t
++                into.bloom = bloomPeak[charIndex] * (1f - t)
++            }
++            else -> {
++                into.scale = 1f
++                into.shift = 0f
++                into.rise = GROW_REST
++                into.bloom = 0f
++            }
++        }
++    }
++}
++
++/** Where one letter of a [GrowingWord] is, filled in by [GrowingWord.sampleInto]. */
++class CharGrowth {
++    /** Swell, about the letter's own centre. 1 is the letter as laid out. */
++    var scale: Float = 1f
++
++    /** Lean away from the middle of the word, in ems. */
++    var shift: Float = 0f
++
++    /** Lift, in multiples of the ordinary sung-word rise. */
++    var rise: Float = 0f
++
++    /** Bloom, 0..1, at its own peak partway up rather than at the top. */
++    var bloom: Float = 0f
++}
++
++/** How long a word takes to rise, and to settle back down once it is past. */
++private const val RISE_MS = 700f
++
++/** The quickest a word ever rises: a 90 ms syllable snapping up reads as a twitch. */
++private const val RISE_MIN_MS = 250f
++
++/**
++ * How far up a word goes, as a share of the full lift, from how long it is held.
++ *
++ * A word sung in [LIFT_QUICK_MS] or less only nudges up by [LIFT_FLOOR]; one
++ * held for [LIFT_HELD_MS] or more goes the whole way. Eased between the two, so
++ * the words of an ordinary line differ from one another by a little rather than
++ * falling into "up" and "not up".
++ */
++private fun liftHeight(word: LyricWord): Float {
++    val held = (word.endMs - word.startMs).toFloat()
++    val through = ((held - LIFT_QUICK_MS) / (LIFT_HELD_MS - LIFT_QUICK_MS)).coerceIn(0f, 1f)
++    return LIFT_FLOOR + (1f - LIFT_FLOOR) * smooth(through)
++}
++
++private const val LIFT_QUICK_MS = 150f
++private const val LIFT_HELD_MS = 900f
++private const val LIFT_FLOOR = 0.25f
++
++/** Ease in and out of the ends, so the lift has no corners on it. */
++private fun smooth(fraction: Float) = fraction * fraction * (3f - 2f * fraction)
++
++/**
++ * Whether this word is held long enough, and is short enough, to be animated a
++ * letter at a time.
++ *
++ * The thresholds are steeper for short words than the length alone suggests: a
++ * two-letter word held for a second is a held note, whereas a seven-letter one
++ * held for the same second is just being sung at an ordinary pace, and only the
++ * first of those has anything to show.
++ *
++ * Scripts whose letters are not laid out side by side independently are left
++ * alone — Han, kana and Hangul draw as blocks, and right-to-left scripts join
++ * up, so moving one letter of a word would come apart rather than swell. A
++ * hyphenated word is really two words and would break at the hyphen.
++ */
++private fun LyricWord.canGrow(): Boolean {
++    val length = text.length
++    if (length == 0 || length > GROW_MAX_CHARS) return false
++    if ('-' in text || text.any { it.isBlockScript() || it.isJoinedScript() }) return false
++    val held = endMs - startMs
++    return when {
++        length == 1 -> held >= GROW_MIN_SOLO_MS
++        length <= 3 -> held >= GROW_MIN_SHORT_MS + (length - 2) * GROW_SHORT_STEP_MS
++        length == 4 -> held >= GROW_MIN_FOUR_MS
++        else -> held >= GROW_MIN_LONG_MS && held >= length * GROW_MS_PER_CHAR
++    }
++}
++
++/**
++ * How much of the movement is taken back off the later letters of a word.
++ *
++ * Two reasons to hold back. A long word is a lot of letters to run a wave
++ * through, and left flat the tail of it is still swelling well after the singer
++ * has moved on. A word held only just long enough to qualify has no room for a
++ * wave at all, so the whole thing is damped towards a single swell.
++ */
++private fun decayRate(length: Int, heldMs: Float): Float {
++    val long = length > GROW_DECAY_LONG_CHARS
++    val quick = heldMs < GROW_DECAY_QUICK_MS
++    if (!long && !quick) return 0f
++    var strength = 0f
++    if (long) {
++        strength += minOf((length - GROW_DECAY_LONG_CHARS) / 5f, 1f) * GROW_DECAY_LONG
++    }
++    if (quick) {
++        val short = maxOf(0f, 1f - (heldMs - GROW_DECAY_QUICK_FLOOR_MS) / 400f)
++        strength += short * if (length > 3) GROW_DECAY_QUICK else GROW_DECAY_QUICK_TINY
++    }
++    return minOf(strength, GROW_DECAY_MAX)
++}
++
++private fun Char.isBlockScript(): Boolean =
++    this in '一'..'鿿' || this in '぀'..'ゟ' ||
++        this in '゠'..'ヿ' || this in '가'..'힯'
++
++private fun Char.isJoinedScript(): Boolean =
++    this in '֐'..'ࣿ'
++
++/** Longest word worth running a wave through; past this it reads as a ripple. */
++private const val GROW_MAX_CHARS = 7
++
++/** How long a word of each length has to be held before it qualifies. */
++private const val GROW_MIN_SOLO_MS = 1_100L
++private const val GROW_MIN_SHORT_MS = 1_360L
++private const val GROW_SHORT_STEP_MS = 140L
++private const val GROW_MIN_FOUR_MS = 1_050L
++private const val GROW_MIN_LONG_MS = 900L
++private const val GROW_MS_PER_CHAR = 200L
++
++private const val GROW_DECAY_LONG_CHARS = 5
++private const val GROW_DECAY_QUICK_MS = 1_200f
++private const val GROW_DECAY_QUICK_FLOOR_MS = 800f
++private const val GROW_DECAY_LONG = 0.4f
++private const val GROW_DECAY_QUICK = 0.3f
++private const val GROW_DECAY_QUICK_TINY = 0.1f
++private const val GROW_DECAY_MAX = 0.7f
++
++/**
++ * Each letter starts this far — as a share of the word's own length — after the
++ * one before it, so the swell travels rather than pulsing.
++ */
++private const val GROW_STAGGER = 0.09f
++
++/** The whole move runs half again as long as the word is held. */
++private const val GROW_SPAN = 1.5f
++
++/** Up by [GROW_IN], held to [GROW_HOLD], settled by [GROW_OUT]. */
++private const val GROW_IN = 0.25f
++private const val GROW_HOLD = 0.30f
++private const val GROW_OUT = 0.75f
++
++/** Where a letter comes to rest: the same small lift every sung word carries. */
++private const val GROW_REST = 1f
++
++/** The window over which a longer hold earns more of the treatment. */
++private const val GROW_RAMP_MIN_MS = 400f
++private const val GROW_RAMP_MAX_MS = 3_000f
++
++/** Swell every qualifying letter gets, and the range the hold adds on top. */
++private const val GROW_BASE_SHORT = 0.05f
++private const val GROW_BASE_LONG = 0.04f
++private const val GROW_SCALE_RANGE = 0.08f
++
++/** The most any letter swells, which is what [GrowingWord] reads the lift off. */
++private const val GROW_SCALE_CEILING = 0.1f
++
++/** Taken back off the swell so it stops a hair short of the ceiling. */
++private const val GROW_SCALE_TRIM = 0.98f
++
++/** Lean, as a share of the font size at full swell. */
++private const val GROW_SHIFT_EM = 25f / 34f
++
++/** The bloom's floor, and what the hold adds to it. */
++private const val GROW_BLOOM_FLOOR = 0.35f
++private const val GROW_BLOOM_RANGE = 0.45f
++private const val GROW_BLOOM_PACE_MS = 1_500f
++private const val GROW_BLOOM_PACE_MAX = 1.1f
++private const val GROW_BLOOM_SHORT = 0.85f
++private const val GROW_BLOOM_LONG = 1.1f
++
++/** A word held this long lifts as far as it is going to. */
++private const val GROW_LIFT_PACE_MS = 2_000f
++private const val GROW_LIFT_FLOOR = 0.3f
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncedLineText.kt b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncedLineText.kt
+new file mode 100644
+index 0000000..298e7da
+--- /dev/null
++++ b/app/src/main/java/com/unshoo/pixelmusic/presentation/components/wordsync/WordSyncedLineText.kt
+@@ -0,0 +1,718 @@
++package com.unshoo.pixelmusic.presentation.components.wordsync
++
++/*
++ * Word-by-word lyric renderer: smooth sweep inside each word, lift of the word
++ * being sung, and bloom + letter-by-letter growth on held notes.
++ *
++ * Ported from BitChord (https://github.com/kushagrasinghx/BitChord, GPL-3.0),
++ * file sharedUi/.../ui/player/PlayerLyrics.kt, adapted for Pixel Music. The
++ * drawing helpers below the composable are BitChord's, kept as they were; the
++ * composable itself is rewritten around Pixel's row (no duet lanes, particles
++ * or translation controls). The sweep follows the idea of am-lyrics by binimum.
++ */
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.derivedStateOf
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.structuralEqualityPolicy
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.BlurredEdgeTreatment
++import androidx.compose.ui.draw.blur
++import androidx.compose.ui.draw.drawWithContent
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.BlendMode
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.CompositingStrategy
++import androidx.compose.ui.graphics.drawscope.ContentDrawScope
++import androidx.compose.ui.graphics.drawscope.DrawScope
++import androidx.compose.ui.graphics.drawscope.clipRect
++import androidx.compose.ui.graphics.drawscope.scale
++import androidx.compose.ui.graphics.drawscope.translate
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.layout.layout
++import androidx.compose.ui.text.TextLayoutResult
++import androidx.compose.ui.text.TextStyle
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.offset
++
++/** How far the sweep's leading edge fades out instead of ending on a cut. */
++private val WIPE_FEATHER = 30.dp
++
++/** How far a word being sung is lifted off its line. */
++private val WORD_RISE = 2.dp
++
++/** Extra headroom above a row holding a letter-by-letter animated word, in multiples of [WORD_RISE]. */
++private const val GROW_HEADROOM = 3f
++
++/** Strongest bloom behind a held note; kept well under half so it reads as light, not a second copy. */
++private const val GLOW_ALPHA = 0.62f
++private val GLOW_RADIUS = 6.dp
++
++/** Room reserved inside each copy of a line for the halo to spread into. */
++private val GLOW_ROOM = 10.dp
++
++private const val PHASE_BEFORE = 0
++private const val PHASE_MOVING = 1
++private const val PHASE_AFTER = 2
++
++/**
++ * One lyric line drawn with word/syllable-accurate highlighting.
++ *
++ * Two copies of the same text are stacked: a dim one and a lit one clipped to
++ * whatever has been sung so far, so the two lay out identically. A third,
++ * blurred copy behind them carries the bloom of held notes.
++ *
++ * Every copy is set in bold, whether or not the line is active, so the
++ * highlight never changes the layout.
++ *
++ * [positionMs] is the playback position; it is read in the draw phase, and a
++ * line nobody is singing never redraws (see the phase logic below).
++ * [feather] should be true only for the line currently being sung.
++ */
++@Composable
++internal fun WordSyncedLineText(
++    line: LyricLine,
++    positionMs: Long,
++    style: TextStyle,
++    litColor: Color,
++    dimColor: Color,
++    textAlign: TextAlign,
++    boxAlignment: Alignment,
++    feather: Boolean,
++    glowEnabled: Boolean,
++    riseEnabled: Boolean,
++    modifier: Modifier = Modifier,
++) {
++    var layout by remember(line) { mutableStateOf<TextLayoutResult?>(null) }
++    val clock = rememberUpdatedState(positionMs)
++
++    // Reused for every letter of every held word instead of allocated per frame.
++    val growth = remember { CharGrowth() }
++
++    // Not started / moving / done: changes three times per line instead of
++    // sixty times a second, so lines that are not being sung do not redraw.
++    val phase = remember(line, clock) {
++        derivedStateOf(structuralEqualityPolicy()) {
++            val now = clock.value
++            when {
++                now < line.animatesFromMs -> PHASE_BEFORE
++                now > line.animatesUntilMs -> PHASE_AFTER
++                else -> PHASE_MOVING
++            }
++        }
++    }
++    val drawnAt: () -> Long = {
++        when (phase.value) {
++            PHASE_MOVING -> clock.value
++            PHASE_BEFORE -> line.animatesFromMs - 1
++            else -> line.animatesUntilMs + 1
++        }
++    }
++
++    val room: Dp = if (glowEnabled) GLOW_ROOM else 0.dp
++    val roomPadding = if (room > 0.dp) Modifier.padding(room) else Modifier
++    val copyStyle = remember(style, textAlign) {
++        style.copy(fontWeight = FontWeight.Bold, textAlign = textAlign)
++    }
++
++    val riseAgainst: (Modifier) -> Modifier = { inner ->
++        if (!riseEnabled) {
++            inner
++        } else {
++            Modifier
++                .drawWithContent {
++                    val measured = layout
++                    if (measured == null || line.words.isEmpty()) {
++                        drawContent()
++                    } else {
++                        riseWith(
++                            layout = measured,
++                            line = line,
++                            positionMs = drawnAt(),
++                            inset = room.toPx(),
++                            peak = WORD_RISE.toPx(),
++                            growth = growth,
++                        )
++                    }
++                }
++                .then(inner)
++        }
++    }
++
++    val sweep = Modifier.drawWithContent {
++        val position = drawnAt()
++        when {
++            position >= line.endMs -> drawContent()
++            position <= line.timeMs -> Unit
++            else -> layout?.let {
++                sweepTo(it, line.revealedChars(position), line.sweepSpans, feather)
++            }
++        }
++    }
++
++    Box(
++        modifier = modifier.giveBackRoom(room),
++        contentAlignment = boxAlignment,
++    ) {
++        Text(
++            text = line.text,
++            style = copyStyle,
++            color = dimColor,
++            onTextLayout = { layout = it },
++            modifier = riseAgainst(roomPadding),
++        )
++        if (glowEnabled) {
++            Text(
++                text = line.text,
++                style = copyStyle,
++                color = litColor,
++                modifier = Modifier
++                    .graphicsLayer { alpha = GLOW_ALPHA }
++                    .blur(GLOW_RADIUS, BlurredEdgeTreatment.Unbounded)
++                    .then(roomPadding)
++                    // Each letter is masked to its own brightness with DstIn,
++                    // which needs a layer of its own to erase into.
++                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
++                    .drawWithContent {
++                        val measured = layout ?: return@drawWithContent
++                        glowGrown(
++                            layout = measured,
++                            line = line,
++                            positionMs = drawnAt(),
++                            inset = room.toPx(),
++                            peak = WORD_RISE.toPx(),
++                            growth = growth,
++                        )
++                    },
++            )
++        }
++        Text(
++            text = line.text,
++            style = copyStyle,
++            color = litColor,
++            modifier = riseAgainst(
++                Modifier
++                    .graphicsLayer {
++                        // The feather erases into this layer, so it must exist,
++                        // but only on the line being sung.
++                        compositingStrategy = if (feather) {
++                            CompositingStrategy.Offscreen
++                        } else {
++                            CompositingStrategy.Auto
++                        }
++                    }
++                    .then(roomPadding)
++                    .then(sweep),
++            ),
++        )
++    }
++}
++
++/**
++ * The copies carry [room] of padding on every side so the blurred copy has
++ * somewhere to put its halo. This hands that space back: the text is measured
++ * at the width the caller offered, and the stack reports a size [room] smaller
++ * on each side, so the row's own layout is the same with or without the glow.
++ */
++private fun Modifier.giveBackRoom(room: Dp): Modifier =
++    if (room <= 0.dp) {
++        this
++    } else {
++        layout { measurable, constraints ->
++            val r = room.roundToPx()
++            val placeable = measurable.measure(constraints.offset(horizontal = 2 * r))
++            val width = (placeable.width - 2 * r).coerceAtLeast(0)
++            val height = (placeable.height - 2 * r).coerceAtLeast(0)
++            layout(width, height) { placeable.place(-r, -r) }
++        }
++    }
++
++/** Moves what [block] draws down by [dy] inside a clip, on Android a plain clip + translate. */
++private fun DrawScope.clipShiftedDown(
++    left: Float,
++    top: Float,
++    right: Float,
++    bottom: Float,
++    dy: Float,
++    block: DrawScope.() -> Unit,
++) {
++    clipRect(left = left, top = top, right = right, bottom = bottom) {
++        translate(top = dy) { block() }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Drawing helpers, from BitChord.
++// ---------------------------------------------------------------------------
++
++private fun ContentDrawScope.glowGrown(
++    layout: TextLayoutResult,
++    line: LyricLine,
++    positionMs: Long,
++    inset: Float,
++    peak: Float,
++    growth: CharGrowth,
++) {
++    if (!line.isGrowing(positionMs)) return
++    val em = layout.layoutInput.style.fontSize.toPx()
++    val length = layout.layoutInput.text.length
++    for (word in line.growingWords) {
++        if (positionMs < word.startMs || positionMs > word.restsAtMs) continue
++        val span = line.wordSpans[word.index]
++        val fall = line.wordFall(word.index, positionMs)
++        for (char in span.first..minOf(span.last, length - 1)) {
++            word.sampleInto(char - span.first, positionMs, growth)
++            if (growth.bloom <= 0.01f) continue
++            val visualLine = layout.getLineForOffset(char)
++            // Row-aware, for the same reason the sweep is; see [xOn].
++            val from = layout.xOn(char, visualLine, inset)
++            val to = layout.xOn(char + 1, visualLine, inset)
++            if (to <= from) continue
++            val dx = growth.shift * em
++            val dy = -growth.rise * peak * fall
++            val rowTop = layout.getLineTop(visualLine) + inset
++            val bottom = layout.getLineBottom(visualLine) + inset
++            val overhang = (to - from) * (growth.scale - 1f) / 2f
++            clipRect(
++                left = from - overhang + dx,
++                top = rowTop - peak * GROW_HEADROOM,
++                right = to + overhang + dx,
++                bottom = bottom,
++            ) {
++                translate(left = dx, top = dy) {
++                    scale(
++                        growth.scale,
++                        growth.scale,
++                        Offset((from + to) / 2f, (rowTop + bottom) / 2f),
++                    ) {
++                        this@glowGrown.drawContent()
++                    }
++                }
++                // Scoped to this letter's own clip, so it takes this letter's
++                // brightness down and leaves its neighbours — which have their
++                // own, a beat behind — where they are.
++                drawRect(
++                    color = Color.White.copy(alpha = growth.bloom),
++                    blendMode = BlendMode.DstIn,
++                )
++            }
++        }
++    }
++}
++
++/**
++ * Redraws this row with the word being sung lifted off the line, and the ones
++ * behind it settling back down.
++ *
++ * The line is cut at word boundaries and each piece replayed at its own
++ * height, which is what CSS gets for free by making every syllable its own
++ * box. Cutting between words rather than inside one means no glyph is ever
++ * sliced, and the pieces that are on the floor — which is most of them, most
++ * of the time — are one replay between them rather than one each.
++ *
++ * Costs nothing at all until something is off the floor: a line with no lift
++ * on it draws exactly once, the same as it did before any of this.
++ */
++private fun ContentDrawScope.riseWith(
++    layout: TextLayoutResult,
++    line: LyricLine,
++    positionMs: Long,
++    inset: Float,
++    peak: Float,
++    growth: CharGrowth,
++) {
++    if (!line.isLifted(positionMs)) {
++        drawContent()
++        return
++    }
++    val em = layout.layoutInput.style.fontSize.toPx()
++    for (visualLine in 0 until layout.lineCount) {
++        val lineStart = layout.getLineStart(visualLine)
++        val lineEnd = layout.getLineEnd(visualLine, visibleEnd = true)
++        // The row's own box. Anything standing still is clipped to exactly
++        // this: a band opened upwards would take in the bottom of the row
++        // above and draw it a second time, and two passes of a half-transparent
++        // line do not add up to the same line. That doubled sliver along every
++        // row is what read as the lines overlapping.
++        val top = layout.getLineTop(visualLine) + inset
++        val bottom = layout.getLineBottom(visualLine) + inset
++        var at = lineStart
++        var edge = layout.getLineLeft(visualLine) + inset
++        for (index in line.words.indices) {
++            val span = line.wordSpans[index]
++            val start = maxOf(span.first, lineStart)
++            val end = minOf(span.last + 1, lineEnd)
++            if (start >= end) continue
++            // Only while it is actually moving. Once the last letter has come to
++            // rest the word is back to being an ordinary sung word settling
++            // down, and the two agree exactly at the handover — a letter rests
++            // at precisely the lift [LyricLine.wordLift] would give it — so the
++            // cheaper single slice takes over without a step.
++            val held = line.growingAt(index)?.takeIf { positionMs in it.startMs..it.restsAtMs }
++            val lift = line.wordLift(index, positionMs)
++            // A word with nothing happening to it is left to the flat run,
++            // which is the whole of the line for all but a syllable of it.
++            if (held == null && lift <= 0.01f) continue
++            val from = layout.xOn(start, visualLine, inset)
++            val to = layout.xOn(end, visualLine, inset)
++            // Nothing to cut. Left where it is rather than stepped over, so the
++            // flat run still has it and the row keeps its words.
++            if (to <= from) continue
++            // Everything between the last risen word and this one is flat, and
++            // goes down in a single piece however many words that spans.
++            if (start > at) sliceRisen(edge, top, from, bottom, 0f)
++            if (held != null) {
++                growEach(
++                    layout, held, line, positionMs, visualLine,
++                    start, end, top, bottom, inset, peak, em, growth,
++                )
++            } else {
++                // Only what is off the floor gets room above the row to be off
++                // it in; see [top].
++                sliceRisen(from, top - peak, to, bottom, -lift * peak)
++            }
++            at = end
++            edge = to
++        }
++        if (at < lineEnd) {
++            sliceRisen(edge, top, layout.getLineRight(visualLine) + inset, bottom, 0f)
++        }
++    }
++}
++
++/**
++ * Redraws one held word a letter at a time, each at its own swell and height.
++ *
++ * The word is cut between characters rather than between words, so a letter can
++ * be scaled about its own centre without the ones either side of it coming
++ * along. Each piece is clipped to where its letter is *going* rather than where
++ * it sits: a glyph grown about its middle reaches past the box it was laid out
++ * in, and clipping to that box would shave both sides off it as it swells.
++ *
++ * The overlap that buys — a letter's clip reaching a pixel or so into its
++ * neighbour's — is why this is only ever run on a word that has earned it. Two
++ * copies of a glyph edge a pixel apart is nothing on a letter mid-swell and
++ * would be an obvious double image across a whole line.
++ */
++@Suppress("LongParameterList")
++private fun ContentDrawScope.growEach(
++    layout: TextLayoutResult,
++    word: GrowingWord,
++    line: LyricLine,
++    positionMs: Long,
++    visualLine: Int,
++    start: Int,
++    end: Int,
++    top: Float,
++    bottom: Float,
++    inset: Float,
++    peak: Float,
++    em: Float,
++    growth: CharGrowth,
++) {
++    // The settle is shared with every other word: a letter comes to rest at the
++    // same small lift, and then goes down with the rest of the line.
++    val fall = line.wordFall(word.index, positionMs)
++    val first = line.wordSpans[word.index].first
++    // Room to swell into, above the row rather than inside it. The pivot stays
++    // on the row's own middle: scaling about the middle of the *band* would
++    // walk every letter downwards as it grew.
++    val ceiling = top - peak * GROW_HEADROOM
++    val middle = (top + bottom) / 2f
++    for (char in start until end) {
++        word.sampleInto(char - first, positionMs, growth)
++        val from = layout.xOn(char, visualLine, inset)
++        val to = layout.xOn(char + 1, visualLine, inset)
++        if (to <= from) continue
++        val dx = growth.shift * em
++        val dy = -growth.rise * peak * fall
++        val overhang = (to - from) * (growth.scale - 1f) / 2f
++        clipShiftedDown(
++            left = from - overhang + dx,
++            top = ceiling,
++            right = to + overhang + dx,
++            bottom = bottom,
++            dy = dy,
++        ) {
++            translate(left = dx) {
++                scale(growth.scale, growth.scale, Offset((from + to) / 2f, middle)) {
++                    this@growEach.drawContent()
++                }
++            }
++        }
++    }
++}
++
++/**
++ * Where an offset sits horizontally *on the row it was cut out of*.
++ *
++ * [TextLayoutResult.getHorizontalPosition] answers for the row the offset
++ * itself belongs to — and the offset one past the last character of a wrapped
++ * row belongs to the next row, so asking where a word that runs up to a wrap
++ * *ends* gives a position at the far left, one row down. A slice cut between
++ * there and the word's start is empty, and the walk then treats the row as
++ * finished: everything from that word to the end of the row is never drawn.
++ *
++ * Whole rows disappeared that way, and Japanese lines disappeared most, because
++ * Apple's word spans there are whole phrases and reach a wrap on their own where
++ * an English word rarely does.
++ */
++/**
++ * Where a character offset sits across a visual line, in pixels.
++ *
++ * For RTL paragraphs the first character of a visual line is at the right
++ * edge and the last is at the left — this function respects that so callers
++ * (horizontalAt, sweepTo) get correct clip boundaries regardless of text
++ * direction.  Interior offsets delegate to Compose's own cursor-position
++ * calculation which already handles direction; only the two boundary cases
++ * need special handling because getLineLeft / getLineRight return physical
++ * bounding-box edges (always left ≤ right), not paragraph-direction edges.
++ */
++private fun TextLayoutResult.xOn(offset: Int, visualLine: Int, inset: Float): Float {
++    val lineStart = getLineStart(visualLine)
++    val lineEndVisible = getLineEnd(visualLine, visibleEnd = true)
++    val lineLeft = getLineLeft(visualLine) + inset
++    val lineRight = getLineRight(visualLine) + inset
++
++    val rtl = getParagraphDirection(lineStart.coerceIn(0, (layoutInput.text.length - 1).coerceAtLeast(0))) ==
++              androidx.compose.ui.text.style.ResolvedTextDirection.Rtl
++
++    return when {
++        offset <= lineStart -> if (rtl) lineRight else lineLeft
++        offset >= lineEndVisible -> if (rtl) lineLeft else lineRight
++        // The inset belongs on every answer, not just the two edges: the rows
++        // are drawn [inset] in from the layout's origin, and an interior cut
++        // without it lands that far left of the glyph boundary — the lifted
++        // and swelling slices then sliced letters in half.
++        else -> (getHorizontalPosition(offset, usePrimaryDirection = true) + inset)
++            .coerceIn(lineLeft, lineRight)
++    }
++}
++
++/** One piece of a line, clipped to its own width and drawn at its own height. */
++private fun ContentDrawScope.sliceRisen(
++    from: Float,
++    top: Float,
++    to: Float,
++    bottom: Float,
++    dy: Float,
++) {
++    if (to <= from) return
++    clipShiftedDown(left = from, top = top, right = to, bottom = bottom, dy = dy) {
++        this@sliceRisen.drawContent()
++    }
++}
++
++/**
++ * Where a fractional character index sits across a visual line, in pixels.
++ *
++ * Inside a timed piece — a syllable, or a word nobody split — that sits whole
++ * on this row, the index is read as a share of the piece and laid across its
++ * width. Read letter by letter instead, the edge crossed a "w" in the same time
++ * as an "i": it sped up and slowed down inside every word, a wobble that a held
++ * note made plain. am-lyrics wipes each syllable across its box at a constant
++ * rate, and this is the same thing.
++ */
++private fun horizontalAt(
++    layout: TextLayoutResult,
++    chars: Float,
++    visualLine: Int,
++    spans: List<IntRange>,
++): Float {
++    val lineStart = layout.getLineStart(visualLine)
++    val lineEndVisible = layout.getLineEnd(visualLine, visibleEnd = true)
++    // Use the *all* end (including trailing whitespace/punctuation) for the
++    // boundary check — visibleEnd can exclude chars that sit at the physical
++    // edge of an RTL line and would cause xOn to resolve to the next visual
++    // line instead of the current one's far edge.
++    val lineEndAll = layout.getLineEnd(visualLine, visibleEnd = false)
++    val word = spans.firstOrNull { chars >= it.first && chars < it.last + 1 }
++    if (word != null && word.first >= lineStart && word.last + 1 <= lineEndVisible) {
++        val from = layout.xOn(word.first, visualLine, 0f)
++        val to = layout.xOn(word.last + 1, visualLine, 0f)
++        return from + (to - from) * (chars - word.first) / (word.last + 1 - word.first)
++    }
++    // A word broken over a wrap, or the space between two words: letter by
++    // letter, which is all a single space or a half-word needs.
++    val index = chars.toInt().coerceIn(lineStart, lineEndAll)
++    // Row-aware at both ends: on the last character of a wrapped row the next
++    // position belongs to the row below, and read straight it puts the edge
++    // back at the left margin — the highlight jumped backwards a letter before
++    // every wrap.  Guard against that by checking whether index+1 would land
++    // on the next visual line; if so, clamp to this line's far edge instead.
++    val here = layout.xOn(index, visualLine, 0f)
++    val rawNext = index + 1
++    val textLen = layout.layoutInput.text.length
++    val spills: Boolean = layout.getLineForOffset(rawNext.coerceIn(0, textLen)) != visualLine
++    val next: Float = if (spills) {
++        // Spilled to the next visual line: use this line's far edge as the
++        // interpolation target.  For RTL that is getLineLeft; for LTR it is
++        // getLineRight.  The fallback below (xOn with coerceAtMost(lineEnd))
++        // would return the wrong side for RTL.
++        if (rawNext > lineEndVisible) {
++            // At or past the visible end: use the all-end edge.
++            val rtl = layout.getParagraphDirection(
++                visualLine.coerceAtMost(lineEndAll).coerceIn(0, textLen - 1)
++            ) == androidx.compose.ui.text.style.ResolvedTextDirection.Rtl
++            val farLeft = layout.getLineLeft(visualLine)
++            val farRight = layout.getLineRight(visualLine)
++            // For RTL, the "far" edge in character order is getLineLeft;
++            // for LTR it is getLineRight.  We detect by comparing the two:
++            if (rtl) farLeft else farRight
++        } else {
++            layout.xOn(rawNext.coerceAtMost(lineEndVisible), visualLine, 0f)
++        }
++    } else {
++        layout.xOn(rawNext, visualLine, 0f)
++    }
++    return here + (next - here) * (chars - index)
++}
++
++/**
++ * Draws this text clipped to its first [revealedChars] characters.
++ *
++ * Wrapped lines are handled a visual line at a time: the ones already passed
++ * are drawn whole, the one holding the boundary is cut at it, and the rest are
++ * left to the dim copy. Within a word the cut moves across the word's width
++ * at a steady rate — see [horizontalAt] — rather than jumping a letter at a
++ * time. [spans] are the line's timed pieces, [LyricLine.sweepSpans]; empty, the
++ * cut goes letter by letter.
++ *
++ * The boundary itself is then feathered over the [WIPE_FEATHER] ahead of it
++ * rather than left as the cut, which needs the caller to give this an offscreen layer to erase
++ * into — see [SweptLyricLine]. Only the line actually being sung carries one;
++ * everywhere else the boundary is at one end of the text or the other and
++ * there is nothing to soften.
++ */
++private fun ContentDrawScope.sweepTo(
++    layout: TextLayoutResult,
++    revealedChars: Float,
++    spans: List<IntRange>,
++    feather: Boolean,
++) {
++    if (revealedChars <= 0f) return
++    val textLen = layout.layoutInput.text.length
++    if (revealedChars >= textLen) {
++        drawContent()
++        return
++    }
++    // Derive RTL from the layout's own resolved paragraph direction, not from
++    // text heuristics.  This keeps geometry in lock-step with how Compose
++    // actually laid out the glyphs — critical when a translation line (Hebrew)
++    // sits under an English lead and both get different text-analysis results.
++    val offset = layout.getLineStart(0).coerceIn(0, (layout.layoutInput.text.length - 1).coerceAtLeast(0))
++    val rtl = layout.getParagraphDirection(offset) == androidx.compose.ui.text.style.ResolvedTextDirection.Rtl
++
++    for (visualLine in 0 until layout.lineCount) {
++        val lineStart = layout.getLineStart(visualLine)
++        val lineEndVisible = layout.getLineEnd(visualLine, visibleEnd = true)
++        val lineEndAll = layout.getLineEnd(visualLine, visibleEnd = false)
++
++        // Lines whose character-range start is past the sweep boundary have
++        // nothing lit; lines after that too.  Use `>` (not `>=`) so a line
++        // whose *first* char is exactly at the boundary still gets drawn —
++        // it is the boundary line and must show the feather edge.
++        if (revealedChars <= lineStart) return
++
++        val cut = revealedChars < lineEndAll
++        val charPos = if (cut) {
++            horizontalAt(layout, revealedChars, visualLine, spans)
++        } else {
++            // The sweep has passed this entire visual line.  Its boundary is
++            // the *far* edge: right edge for RTL (lineLeft), left edge for LTR.
++            if (rtl) layout.getLineLeft(visualLine) else layout.getLineRight(visualLine)
++        }
++
++        val lineLeft = layout.getLineLeft(visualLine)
++        val lineRight = layout.getLineRight(visualLine)
++
++        // Clamp the sweep boundary so the clip rect is always valid and never
++        // inverted near the line ends.  For RTL the revealed prefix [0,k) must
++        // occupy [x(k), lineRight], with x(k) clamped inside [lineLeft, lineRight].
++        val safeCharPos = charPos.coerceIn(lineLeft, lineRight)
++
++        // The feather runs *ahead* of the boundary, into what is still to be
++        // sung: lit solid up to now, fading out over the next [WIPE_FEATHER].
++        // Trailing behind it instead, the letter being sung right now was the
++        // dimmest part of the lit copy, and the line ran out of time with a
++        // faded tail still on it and then snapped to full — which read as the
++        // highlight being late. Ahead of it, the fade runs off the end of the
++        // text as the last letter is reached, and the line finishes already
++        // whole.
++        //
++        // Grown in over the first [WIPE_FEATHER] of each row rather than
++        // opened at full width, or the first letter of every row would pop in
++        // half-lit the frame the sweep reached it.
++        val featherPx = if (feather && cut) {
++            minOf(
++                WIPE_FEATHER.toPx(),
++                if (rtl) lineRight - safeCharPos else safeCharPos - lineLeft,
++            )
++        } else {
++            0f
++        }
++        val lead = if (rtl) {
++            (safeCharPos - featherPx).coerceAtLeast(lineLeft)
++        } else {
++            (safeCharPos + featherPx).coerceAtMost(lineRight)
++        }
++
++        // For RTL lines the sweep fills right-to-left: clip from the line's
++        // right edge down to the feather's leading edge.  For LTR it fills
++        // left-to-right as before.
++        val (clipLeft, clipRight) = if (rtl) {
++            lead to lineRight
++        } else {
++            lineLeft to lead
++        }
++
++        // Guard: an empty or inverted clip is a no-op; skip it cleanly.
++        if (clipLeft >= clipRight) continue
++
++        val top = layout.getLineTop(visualLine)
++        val bottom = layout.getLineBottom(visualLine)
++        clipRect(
++            left = clipLeft,
++            top = top,
++            right = clipRight,
++            bottom = bottom,
++        ) {
++            this@sweepTo.drawContent()
++        }
++
++        // Only the visual line holding the boundary has an edge to soften; a
++        // line revealed to its end runs into the wrap, which is not an edge.
++        if (featherPx < 0.5f) continue
++
++        // Scoped to this line's band so the mask cannot reach the lines above
++        // and below it: DstIn erases whatever the source does not cover, and
++        // outside the clip there is no source at all, so they are left alone.
++        // Within it the brush clamps — opaque up to the boundary, gone past
++        // the feather. The gradient keeps its full width even where the clip
++        // is cut short by the end of the row, so the last letters keep fading
++        // up instead of being cut off.
++        clipRect(top = top, bottom = bottom) {
++            drawRect(
++                brush = Brush.horizontalGradient(
++                    0f to Color.White,
++                    1f to Color.Transparent,
++                    startX = safeCharPos,
++                    endX = if (rtl) safeCharPos - featherPx else safeCharPos + featherPx,
++                ),
++                blendMode = BlendMode.DstIn,
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/presentation/screens/SettingsCategoryScreen.kt b/app/src/main/java/com/unshoo/pixelmusic/presentation/screens/SettingsCategoryScreen.kt
+index 31ed33a..8b522cb 100644
+--- a/app/src/main/java/com/unshoo/pixelmusic/presentation/screens/SettingsCategoryScreen.kt
++++ b/app/src/main/java/com/unshoo/pixelmusic/presentation/screens/SettingsCategoryScreen.kt
+@@ -599,6 +599,14 @@ fun SettingsCategoryScreen(
+                                     leadingIcon = { Icon(painterResource(R.drawable.rounded_lyrics_24), null, tint = MaterialTheme.colorScheme.secondary) },
+                                     modifier = Modifier.settingHighlight("item_library_external_lyrics", highlightKey)
+                                 )
++                                SwitchSettingItem(
++                                    title = stringResource(R.string.setcat_lyrics_plus_title),
++                                    subtitle = stringResource(R.string.setcat_lyrics_plus_subtitle),
++                                    checked = uiState.lyricsPlusEnabled,
++                                    onCheckedChange = { settingsViewModel.setLyricsPlusEnabled(it) },
++                                    enabled = uiState.externalLyricsEnabled,
++                                    leadingIcon = { Icon(painterResource(R.drawable.rounded_lyrics_24), null, tint = MaterialTheme.colorScheme.secondary) }
++                                )
+                                 SwitchSettingItem(
+                                     title = stringResource(R.string.setcat_external_artist_images_title),
+                                     subtitle = stringResource(R.string.setcat_external_artist_images_subtitle),
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/presentation/viewmodel/SettingsViewModel.kt b/app/src/main/java/com/unshoo/pixelmusic/presentation/viewmodel/SettingsViewModel.kt
+index 0b0e587..5c61b5d 100644
+--- a/app/src/main/java/com/unshoo/pixelmusic/presentation/viewmodel/SettingsViewModel.kt
++++ b/app/src/main/java/com/unshoo/pixelmusic/presentation/viewmodel/SettingsViewModel.kt
+@@ -82,6 +82,7 @@ data class SettingsUiState(
+     val lyricsSourcePreference: LyricsSourcePreference = LyricsSourcePreference.EMBEDDED_FIRST,
+     val autoScanLrcFiles: Boolean = false,
+     val externalLyricsEnabled: Boolean = false,
++    val lyricsPlusEnabled: Boolean = false,
+     val externalArtistImagesEnabled: Boolean = false,
+     val blockedDirectories: Set<String> = emptySet(),
+     val appRebrandDialogShown: Boolean = false,
+@@ -404,6 +405,12 @@ class SettingsViewModel @Inject constructor(
+             }
+         }
+ 
++        viewModelScope.launch {
++            userPreferencesRepository.lyricsPlusEnabledFlow.collect { enabled ->
++                _uiState.update { it.copy(lyricsPlusEnabled = enabled) }
++            }
++        }
++
+         viewModelScope.launch {
+             userPreferencesRepository.externalArtistImagesEnabledFlow.collect { enabled ->
+                 _uiState.update { it.copy(externalArtistImagesEnabled = enabled) }
+@@ -706,6 +713,12 @@ class SettingsViewModel @Inject constructor(
+         }
+     }
+ 
++    fun setLyricsPlusEnabled(enabled: Boolean) {
++        viewModelScope.launch {
++            userPreferencesRepository.setLyricsPlusEnabled(enabled)
++        }
++    }
++
+     fun setExternalLyricsEnabled(enabled: Boolean) {
+         viewModelScope.launch {
+             userPreferencesRepository.setExternalLyricsEnabled(enabled)
+diff --git a/app/src/main/java/com/unshoo/pixelmusic/utils/LyricsUtils.kt b/app/src/main/java/com/unshoo/pixelmusic/utils/LyricsUtils.kt
+index a747461..11b6725 100644
+--- a/app/src/main/java/com/unshoo/pixelmusic/utils/LyricsUtils.kt
++++ b/app/src/main/java/com/unshoo/pixelmusic/utils/LyricsUtils.kt
+@@ -815,7 +815,12 @@ object LyricsUtils {
+             if (line.isEmpty()) return@any false
+             if (LRC_METADATA_PATTERN.matcher(line).matches()) return@any false
+             val m = KUGOU_LINE_REGEX.matcher(line)
+-            m.matches() && (m.group(1)?.toLongOrNull() ?: 0L) > 999L
++            m.matches() && (
++                (m.group(1)?.toLongOrNull() ?: 0L) > 999L ||
++                    // A line starting inside the first second is still Kugou-style
++                    // when its words carry the <offset,duration,flag> tags.
++                    KUGOU_WORD_PATTERN.matcher(m.group(3) ?: "").find()
++                )
+         }
+     }
+ 
+@@ -849,8 +854,8 @@ object LyricsUtils {
+             val headerMatcher = KUGOU_LINE_REGEX.matcher(line)
+             if (!headerMatcher.matches()) continue
+             val lineStartMs = (headerMatcher.group(1)?.toLongOrNull() ?: continue) + globalOffsetMs
+-            if (lineStartMs <= 999L && globalOffsetMs == 0L) continue
+             val body = headerMatcher.group(3) ?: ""
++            if (lineStartMs <= 999L && globalOffsetMs == 0L && !KUGOU_WORD_PATTERN.matcher(body).find()) continue
+ 
+             val words = mutableListOf<SyncedWord>()
+             val wordMatcher = KUGOU_WORD_PATTERN.matcher(body)
+@@ -858,6 +863,7 @@ object LyricsUtils {
+ 
+             while (wordMatcher.find()) {
+                 val wordOffsetMs = wordMatcher.group(1)?.toLongOrNull() ?: 0L
++                val wordDurationMs = wordMatcher.group(2)?.toLongOrNull() ?: 0L
+                 val rawText = wordMatcher.group(4) ?: ""
+ 
+                 val startsNew = previousEndsWithSpace || rawText.firstOrNull()?.isWhitespace() == true
+@@ -870,7 +876,12 @@ object LyricsUtils {
+                     SyncedWord(
+                         time = (lineStartMs + wordOffsetMs).toInt(),
+                         word = wordText,
+-                        startsNewWord = startsNew
++                        startsNewWord = startsNew,
++                        endTime = if (wordDurationMs > 0L) {
++                            (lineStartMs + wordOffsetMs + wordDurationMs).toInt()
++                        } else {
++                            null
++                        }
+                     )
+                 )
+             }
+diff --git a/app/src/main/res/values-it/strings_settings.xml b/app/src/main/res/values-it/strings_settings.xml
+index e74d7ed..584dd3a 100644
+--- a/app/src/main/res/values-it/strings_settings.xml
++++ b/app/src/main/res/values-it/strings_settings.xml
+@@ -424,4 +424,6 @@
+     <string name="setcat_playback_client_desc">Scegli il client. Android VR è più veloce; Web Client usa YouTube Music.</string>
+     <string name="setcat_playback_client_android_vr">Android VR (Predefinito)</string>
+     <string name="setcat_playback_client_web_remix">Client Web</string>
++    <string name="setcat_lyrics_plus_title">Testi parola per parola (LyricsPlus)</string>
++    <string name="setcat_lyrics_plus_subtitle">Scarica testi sincronizzati sillaba per sillaba dai mirror di LyricsPlus, gestiti da volontari. Invia titolo, artista, album e durata del brano a quei server. Richiede i testi online.</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings_settings.xml b/app/src/main/res/values/strings_settings.xml
+index c642547..fcd2c4e 100644
+--- a/app/src/main/res/values/strings_settings.xml
++++ b/app/src/main/res/values/strings_settings.xml
+@@ -427,4 +427,6 @@
+     <string name="setcat_playback_client_desc">Select stream client. Android VR is faster; Web Client uses YouTube Music.</string>
+     <string name="setcat_playback_client_android_vr">Android VR (Default)</string>
+     <string name="setcat_playback_client_web_remix">Web Client</string>
++    <string name="setcat_lyrics_plus_title">Word-by-word lyrics (LyricsPlus)</string>
++    <string name="setcat_lyrics_plus_subtitle">Fetch syllable-synced lyrics from LyricsPlus mirrors, run by volunteers. Sends the title, artist, album and duration of the song to those servers. Requires online lyrics.</string>
+ </resources>
