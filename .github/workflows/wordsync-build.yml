@@ -1,4 +1,4 @@
-herename: Apply word-sync patch and build APK
+name: Apply word-sync patch and build APK
 
 on:
   workflow_dispatch:
